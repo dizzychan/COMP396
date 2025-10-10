@@ -20,10 +20,11 @@ for data_file in data_files:
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values('Date').reset_index(drop=True)
 
-    # Calculate
+    # Calculate CumPnl open to open
     df['Open_Open'] = df['Open'].diff().fillna(0)
     df['CumPnl_Open_Open'] = df['Open_Open'].cumsum()
 
+    # Draw Cumpnl open to open's table
     plt.figure(figsize=(10, 5))
     plt.plot(df['Date'], df['CumPnl_Open_Open'], color='blue')
     plt.title(f'Open→Open CumPnL ({os.path.basename(data_file)})')
