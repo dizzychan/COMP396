@@ -22,6 +22,7 @@ for data_file in data_files:
 
     # Price movement
     plt.figure(figsize=(10, 5))
+    plt.plot(df['Date'], df['Open'], color='Red', label='Open Price')
     plt.plot(df['Date'], df['Close'], color='blue', label='Close Price')
     plt.title(f'Price Movement ({os.path.basename(data_file)})')
     plt.xlabel('Date')
