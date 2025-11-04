@@ -1,0 +1,8 @@
+{
+  "final_value": 1000000.0,
+  "bankrupt": false,
+  "pd_ratio_portfolio": null,
+  "activity_pct": 0.0,
+  "end_policy": "liquidate",
+  "s_mult": 2.0
+}
