@@ -1,0 +1,13 @@
+trailing_stop_pct,take_profit_pct,pd_ratio,final_value,bankrupt,activity_pct,output_dir
+0.08,0.15,3.5654843338935347,1005392.5125798202,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.08_profit0.15_20251105_021813
+0.08,0.2,1.6798956505030167,1002553.5929798203,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.08_profit0.2_20251105_021813
+0.08,0.25,1.0489068747025263,1001534.2489798204,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.08_profit0.25_20251105_021813
+0.1,0.15,3.337399817296672,1005165.2209798201,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.1_profit0.15_20251105_021813
+0.1,0.2,1.4483908600961939,1002441.3857798203,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.1_profit0.2_20251105_021813
+0.1,0.25,0.7424267584571448,1001055.3217798205,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.1_profit0.25_20251105_021813
+0.12,0.15,3.1070957955909044,1005114.0011798199,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.12_profit0.15_20251105_021813
+0.12,0.2,1.0717335677697766,1002021.07557982,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.12_profit0.2_20251105_021813
+0.12,0.25,0.481377347805184,1000605.96357982,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.12_profit0.25_20251105_021813
+0.15,0.15,3.6590813851981574,1005577.2909798202,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.15_profit0.15_20251105_021813
+0.15,0.2,1.5540764020212963,1002862.9553798201,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.15_profit0.2_20251105_021813
+0.15,0.25,1.2340277708700949,1001785.9473798202,False,88.41870824053453,/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MAC_Optimization/stage2/stop0.15_profit0.25_20251105_021813

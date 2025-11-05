@@ -1,0 +1,22 @@
+{
+  "optimization_timestamp": "2025-11-05 02:18:32",
+  "final_parameters": {
+    "allow_short": true,
+    "use_dynamic_size": true,
+    "size_constant": 5000,
+    "printlog": false,
+    "fast": 15,
+    "slow": 40,
+    "trailing_stop_pct": 0.15,
+    "take_profit_pct": 0.15
+  },
+  "stage1_best": {
+    "fast": 15,
+    "slow": 40
+  },
+  "stage2_best": {
+    "trailing_stop_pct": 0.15,
+    "take_profit_pct": 0.15
+  },
+  "recommendation": "Use these parameters for validation testing"
+}

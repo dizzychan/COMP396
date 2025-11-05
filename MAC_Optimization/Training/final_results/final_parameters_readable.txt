@@ -1,0 +1,18 @@
+MAC STRATEGY - FINAL OPTIMIZED PARAMETERS
+==================================================
+
+Optimization completed: 2025-11-05 02:18:32
+
+CORE PARAMETERS:
+  Fast SMA: 15
+  Slow SMA: 40
+
+RISK MANAGEMENT:
+  Trailing Stop: 0.1%
+  Take Profit: 0.1%
+
+FIXED PARAMETERS:
+  allow_short: True
+  use_dynamic_size: True
+  size_constant: 5000
+  printlog: False

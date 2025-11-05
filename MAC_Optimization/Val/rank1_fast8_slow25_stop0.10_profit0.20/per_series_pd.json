@@ -1,0 +1,62 @@
+[
+  {
+    "series": "S0",
+    "pd_ratio": -0.32677016281711596,
+    "final_cumPnL": -336.5700000000017,
+    "max_drawdown": 1029.9900000000014
+  },
+  {
+    "series": "S1",
+    "pd_ratio": -0.8965359377384404,
+    "final_cumPnL": -1468.75,
+    "max_drawdown": 1638.25
+  },
+  {
+    "series": "S2",
+    "pd_ratio": -0.6183145361718974,
+    "final_cumPnL": -440.2538000000018,
+    "max_drawdown": 712.022400000001
+  },
+  {
+    "series": "S3",
+    "pd_ratio": 3.0399805943599314,
+    "final_cumPnL": 2443.8100000000013,
+    "max_drawdown": 803.8899999999987
+  },
+  {
+    "series": "S4",
+    "pd_ratio": 2.788221775351906,
+    "final_cumPnL": 485.290000000001,
+    "max_drawdown": 174.05000000000064
+  },
+  {
+    "series": "S5",
+    "pd_ratio": -0.13925909534394917,
+    "final_cumPnL": -138.4500000000011,
+    "max_drawdown": 994.190000000002
+  },
+  {
+    "series": "S6",
+    "pd_ratio": 0.2320167697442048,
+    "final_cumPnL": 16.602936100000335,
+    "max_drawdown": 71.5592072000004
+  },
+  {
+    "series": "S7",
+    "pd_ratio": 0.34542160153502666,
+    "final_cumPnL": 87.6033429999989,
+    "max_drawdown": 253.6128100000014
+  },
+  {
+    "series": "S8",
+    "pd_ratio": -0.7608578255393775,
+    "final_cumPnL": -484.8128999999999,
+    "max_drawdown": 637.1925000000001
+  },
+  {
+    "series": "S9",
+    "pd_ratio": -0.847788446403274,
+    "final_cumPnL": -1346.5,
+    "max_drawdown": 1588.25
+  }
+]
