@@ -1,0 +1,52 @@
+{
+  "optimization_timestamp": "2025-11-06 10:56:53",
+  "total_combinations_tested": 48,
+  "valid_combinations": 48,
+  "top_3_combinations": [
+    {
+      "rank": 1,
+      "parameters": {
+        "macd_fast": 8,
+        "macd_slow": 35,
+        "macd_signal": 5
+      },
+      "performance": {
+        "pd_ratio": 1.4175857722175547,
+        "final_value": 1000762.2955801983,
+        "activity_pct": 90.86859688195992,
+        "bankrupt": false
+      },
+      "output_directory": "/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow35_signal5_20251106_105339"
+    },
+    {
+      "rank": 2,
+      "parameters": {
+        "macd_fast": 8,
+        "macd_slow": 20,
+        "macd_signal": 5
+      },
+      "performance": {
+        "pd_ratio": 1.2874554897186514,
+        "final_value": 1000505.5029133973,
+        "activity_pct": 93.54120267260579,
+        "bankrupt": false
+      },
+      "output_directory": "/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow20_signal5_20251106_105339"
+    },
+    {
+      "rank": 3,
+      "parameters": {
+        "macd_fast": 8,
+        "macd_slow": 26,
+        "macd_signal": 5
+      },
+      "performance": {
+        "pd_ratio": 1.0862831449382695,
+        "final_value": 1000582.6692089988,
+        "activity_pct": 92.65033407572383,
+        "bankrupt": false
+      },
+      "output_directory": "/Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow26_signal5_20251106_105339"
+    }
+  ]
+}

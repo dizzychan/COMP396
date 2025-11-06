@@ -1,0 +1,31 @@
+MOMENTUMBREAKOUT STRATEGY - TOP 3 PARAMETER COMBINATIONS
+============================================================
+
+Optimization completed: 2025-11-06 10:56:53
+Total combinations tested: 48
+Valid combinations: 48
+
+Rank #1:
+  Parameters: Fast=8, Slow=35, Signal=5
+  PD Ratio: 1.4176
+  Final Value: $1,000,762.30
+  Activity: 90.87%
+  Bankrupt: False
+  Output Dir: /Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow35_signal5_20251106_105339
+
+Rank #2:
+  Parameters: Fast=8, Slow=20, Signal=5
+  PD Ratio: 1.2875
+  Final Value: $1,000,505.50
+  Activity: 93.54%
+  Bankrupt: False
+  Output Dir: /Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow20_signal5_20251106_105339
+
+Rank #3:
+  Parameters: Fast=8, Slow=26, Signal=5
+  PD Ratio: 1.0863
+  Final Value: $1,000,582.67
+  Activity: 92.65%
+  Bankrupt: False
+  Output Dir: /Users/dizzychan/Desktop/BT396_Version_0.1.0/tests/MomentumBreakout Preliminary testing/fast8_slow26_signal5_20251106_105339
+
