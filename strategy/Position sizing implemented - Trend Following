@@ -32,7 +32,7 @@ class MACBBStrategy(bt.Strategy):
         size_constant=5000.0,
         fixed_stake=1,
 
-        # --- Inverse Volatility Sizing Parameters (PDF rule) ---
+        # --- Inverse Volatility Sizing Parameters ---
         use_inv_vol_sizing=True,           # turn on inverse-vol sizing
         invvol_lookback=20,                # lookback for avg abs daily change
         total_exposure=1_000_000.0,         # scale so total exposure = £1,000,000
@@ -173,7 +173,7 @@ class MACBBStrategy(bt.Strategy):
     def next(self):
         """ Core strategy logic, runs on every bar """
 
-        # --- Inverse volatility budgets updated each bar (added) ---
+        # --- Inverse volatility budgets updated each bar ---
         if self.p.use_inv_vol_sizing:
             self._compute_invvol_budgets()
 
