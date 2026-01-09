@@ -1,0 +1,285 @@
+import math
+import datetime
+import backtrader as bt
+
+
+class AbsChange(bt.Indicator):
+    """
+    |close_t - close_{t-1}| for the series.
+    Used to compute average absolute daily price change (vol proxy).
+    """
+    lines = ("abschg",)
+
+    def __init__(self):
+        self.l.abschg = abs(self.data0 - self.data0(-1))
+
+
+class MomentumBreakout(bt.Strategy):
+    params = (
+        ("stake", 10),  # fallback units if inv-vol disabled or budgets not ready
+        ("series_index", 0),
+        ("allow_short", True),
+
+        # MACD
+        ("macd_fast", 12),
+        ("macd_slow", 26),
+        ("macd_signal", 9),
+        ("require_cross", True),
+
+        # ATR Trailing Stop
+        ("use_atr_trail", True),
+        ("atr_ts_mult", 2.0),
+        ("atr_period", 14),
+
+        # --- Inverse Volatility Sizing ---
+        ("use_inv_vol_sizing", True),
+        ("invvol_lookback", 20),
+        ("total_exposure", 1_000_000.0),
+        ("min_avg_abs_change", 1e-8),
+        ("max_units", 100000),
+    )
+
+    def _dname(self, d):
+        return getattr(d, "_name", str(d))
+
+    def _log(self, d, txt):
+        dt = d.datetime.date(0)
+        print(f"{dt} [{self._dname(d)}] {txt}")
+
+    # Init: Create independent indicators and states for each data feed
+    def start(self):
+        self.macd = {}
+        self.cross = {}
+        self.atr = {}
+        self.entry_price = {}
+        self.highest_since_entry = {}
+        self.lowest_since_entry = {}
+
+        # --- Inverse vol sizing state ---
+        self.abschg = {}
+        self.avg_abschg = {}
+        self.invvol_budget = {}
+
+        for d in self.datas:
+            self.macd[d] = bt.indicators.MACD(
+                d.close,
+                period_me1=int(self.p.macd_fast),
+                period_me2=int(self.p.macd_slow),
+                period_signal=int(self.p.macd_signal),
+            )
+            self.cross[d] = bt.indicators.CrossOver(self.macd[d].macd, self.macd[d].signal)
+            self.atr[d] = bt.indicators.ATR(d, period=int(self.p.atr_period))
+
+            self.entry_price[d] = None
+            self.highest_since_entry[d] = None
+            self.lowest_since_entry[d] = None
+
+            # --- Inverse vol sizing indicators ---
+            self.abschg[d] = AbsChange(d.close)
+            self.avg_abschg[d] = bt.ind.SMA(self.abschg[d], period=int(self.p.invvol_lookback))
+
+    # Reset extrema when opening, reversing, or closing positions
+    def _reset_extrema(self, d, px, new_pos):
+        if new_pos > 0:
+            self.highest_since_entry[d] = px
+            self.lowest_since_entry[d] = None
+        elif new_pos < 0:
+            self.lowest_since_entry[d] = px
+            self.highest_since_entry[d] = None
+        else:
+            self.highest_since_entry[d] = None
+            self.lowest_since_entry[d] = None
+
+    # --- Inverse volatility sizing helpers ---
+    def _compute_invvol_budgets(self):
+        """
+        vol_i = avg(|close_t - close_{t-1}|) over lookback
+        raw_i = 1 / vol_i
+        w_i = raw_i / sum(raw)
+        budget_i = w_i * total_exposure
+        """
+        raw = {}
+        for d in self.datas:
+            v = float(self.avg_abschg[d][0])
+            if math.isnan(v) or v <= 0:
+                continue
+
+            v = max(float(self.p.min_avg_abs_change), v)
+            raw[d] = 1.0 / v
+
+        s = sum(raw.values())
+        if s <= 0:
+            # keep previous budgets (do not wipe) so behaviour is stable early on
+            return
+
+        budgets = {}
+        total = float(self.p.total_exposure)
+        for d, r in raw.items():
+            w = r / s
+            budgets[d] = w * total
+
+        self.invvol_budget = budgets
+
+    def _pos_size(self, d):
+        """Return units for this data feed (inv-vol if enabled, else stake)."""
+        px = float(d.close[0])
+        if px <= 0 or math.isnan(px):
+            return 0
+
+        if self.p.use_inv_vol_sizing:
+            budget = self.invvol_budget.get(d, None)
+            if budget is not None and budget > 0:
+                units = int(budget // px)
+                units = max(0, min(int(self.p.max_units), units))
+                return units
+
+        return int(self.p.stake)
+
+    # Helper for independent limit orders
+    def _limit_order(self, data, size, anchor_price, atr_mult=0.5):
+        """Attempt to send an extra limit order (supplementing the market order)"""
+        # 1. Budget check
+        if not self.overspend_guard([(data, size)]):
+            return
+
+        # 2. Calculate limit price (Discount based on ATR volatility)
+        # Use ATR if available, otherwise default to 1% discount
+        if data in self.atr:
+            discount = self.atr[data][0] * atr_mult
+        else:
+            discount = anchor_price * 0.01
+
+        if size > 0:  # Buy: Limit lower
+            limit_price = anchor_price - discount
+            limit_price = max(0.01, limit_price)
+        else:  # Sell: Limit higher
+            limit_price = anchor_price + discount
+
+        # 3. Set validity to 1 day (Day Order)
+        valid_until = data.datetime.date(0) + datetime.timedelta(days=1)
+
+        # 4. Place order
+        self.buy(
+            data=data, size=size, price=limit_price, exectype=bt.Order.Limit, valid=valid_until
+        ) if size > 0 else self.sell(
+            data=data, size=size, price=limit_price, exectype=bt.Order.Limit, valid=valid_until
+        )
+
+        self._log(data, f"EXTRA LIMIT: {size} @ {limit_price:.2f}")
+
+    # ---------- Main Logic ----------
+    def next(self):
+        # --- Inverse volatility budgets updated each bar ---
+        if self.p.use_inv_vol_sizing:
+            self._compute_invvol_budgets()
+
+        for d in self.datas:
+            # Indicator readiness guard
+            if (
+                math.isnan(self.macd[d].macd[0])
+                or math.isnan(self.macd[d].signal[0])
+                or math.isnan(self.atr[d][0])
+            ):
+                continue
+
+            close_px = float(d.close[0])
+            cur_pos = int(self.getposition(d).size)
+            atr_now = float(self.atr[d][0])
+
+            # Entry / Increase or Decrease position
+            if self.p.require_cross:
+                long_trigger = self.cross[d][0] > 0   # Golden Cross
+                short_trigger = self.cross[d][0] < 0  # Death Cross
+            else:
+                long_trigger = self.macd[d].macd[0] > self.macd[d].signal[0]
+                short_trigger = self.macd[d].macd[0] < self.macd[d].signal[0]
+
+            delta = 0
+            size = self._pos_size(d)  # dynamic size per series
+            if size <= 0:
+                continue
+
+            if long_trigger:
+                delta = +int(size)
+            elif short_trigger:
+                if self.p.allow_short:
+                    delta = -int(size)
+                else:
+                    if cur_pos > 0:
+                        delta = -min(int(size), cur_pos)
+
+            if delta != 0:
+                if not self.overspend_guard([(d, delta)]):
+                    self._log(d, "Overspend guard; skip entry")
+                    continue
+
+                self.place_market(d, delta)
+
+                # Determine if opening or adding position (not closing/stop loss)
+                is_entry = (cur_pos == 0) or (cur_pos * delta > 0)
+
+                if is_entry:
+                    # Attempt extra limit order.
+                    # atr_mult=0.3 means placing order at "Close - 0.3 * ATR"
+                    self._limit_order(d, delta, close_px, atr_mult=0.3)
+
+                new_pos = cur_pos + delta
+
+                # New/Reverse: Record entry price and extrema start point
+                if (cur_pos == 0 and new_pos != 0) or (cur_pos * new_pos < 0):
+                    self.entry_price[d] = close_px
+                    self._reset_extrema(d, close_px, new_pos)
+
+                # Update extrema during holding 
+                if new_pos > 0:
+                    if self.highest_since_entry[d] is None or close_px > self.highest_since_entry[d]:
+                        self.highest_since_entry[d] = close_px
+                elif new_pos < 0:
+                    if self.lowest_since_entry[d] is None or close_px < self.lowest_since_entry[d]:
+                        self.lowest_since_entry[d] = close_px
+
+                self._log(
+                    d,
+                    f"MACD entry DIF={float(self.macd[d].macd[0]):.4f} "
+                    f"DEA={float(self.macd[d].signal[0]):.4f} ATR={atr_now:.4f} "
+                    f"| pos={cur_pos:+d}, delta={delta:+d}"
+                )
+                continue
+
+            # ATR trailing stop exit logic 
+            if self.p.use_atr_trail and cur_pos != 0:
+                if cur_pos > 0:
+                    if self.highest_since_entry[d] is None or close_px > self.highest_since_entry[d]:
+                        self.highest_since_entry[d] = close_px
+                    trail_long = self.highest_since_entry[d] - self.p.atr_ts_mult * atr_now
+                    if close_px <= trail_long:
+                        delta = -cur_pos
+                else:
+                    if self.lowest_since_entry[d] is None or close_px < self.lowest_since_entry[d]:
+                        self.lowest_since_entry[d] = close_px
+                    trail_short = self.lowest_since_entry[d] + self.p.atr_ts_mult * atr_now
+                    if close_px >= trail_short:
+                        delta = -cur_pos
+
+                if delta != 0:
+                    if not self.overspend_guard([(d, delta)]):
+                        self._log(d, "Overspend guard; skip ATR trail exit")
+                        continue
+                    self.place_market(d, delta)
+                    self.entry_price[d] = None
+                    self._reset_extrema(d, close_px, 0)
+                    self._log(d, "EXIT ATR-TRAIL")
+                    continue
+
+    # ---------- Order Callback ----------
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        d = order.data
+        if order.status in [order.Completed]:
+            action = "BUY" if order.isbuy() else "SELL"
+            self._log(d, f"{action} executed at {order.executed.price:.2f} for size {order.executed.size}")
+        elif order.status in [order.Canceled]:
+            self._log(d, "Order Canceled")
+        elif order.status in [order.Rejected]:
+            self._log(d, "Order Rejected")
