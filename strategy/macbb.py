@@ -2,12 +2,22 @@ import math
 import backtrader as bt
 
 
+class AbsChange(bt.Indicator):
+    """
+    |close_t - close_{t-1}| for the series.
+    Used to compute average absolute daily price change (vol proxy).
+    """
+    lines = ("abschg",)
+
+    def __init__(self):
+        self.l.abschg = abs(self.data0 - self.data0(-1))
+
+
 class MACBBStrategy(bt.Strategy):
     """
     A dual-confirmation trend following strategy based on SMA crossover + Bollinger Bands breakout.
-    
     """
-    
+
     params = dict(
         # --- Strategy Signal Parameters ---
         fast=10,
@@ -21,17 +31,24 @@ class MACBBStrategy(bt.Strategy):
         use_dynamic_size=True,
         size_constant=5000.0,
         fixed_stake=1,
-        
+
+        # --- Inverse Volatility Sizing Parameters ---
+        use_inv_vol_sizing=True,           # turn on inverse-vol sizing
+        invvol_lookback=20,                # lookback for avg abs daily change
+        total_exposure=1_000_000.0,         # scale so total exposure = £1,000,000
+        min_avg_abs_change=1e-8,            # avoid division by zero
+        max_units=100000,                  # cap units as safety
+
         # --- Risk Management Parameters ---
         trailing_stop_pct=0.10,
-        take_profit_pct=0.15,
+        take_profit_pct=False,
         mid_band_buffer=0.995,
-        
+
         # --- Limit Order Parameters ---
         use_limit_orders=True,
         limit_offset_pct=0.002,
         limit_valid_bars=1,
-        
+
         printlog=True,
     )
 
@@ -50,27 +67,32 @@ class MACBBStrategy(bt.Strategy):
         self.bb_bot = {}
         self.cross_top = {}
         self.cross_bot = {}
-        
+
+        # Inverse volatility sizing indicators + budgets (added)
+        self.abschg = {}
+        self.avg_abschg = {}
+        self.invvol_budget = {}
+
         # Initialize state tracking for each data feed
-        self.highest = {}    # Track highest price for long positions (for trailing stop)
-        self.lowest = {}     # Track lowest price for short positions (for trailing stop)
-        self.entry_price = {}  # Actual entry price (for fixed take profit)
-        
+        self.highest = {}
+        self.lowest = {}
+        self.entry_price = {}
+
         # Order management state
         self.order_pending = {}
         self.pending_order = {}
         self.order_submit_bar = {}
-        self.data_idx = {} 
+        self.data_idx = {}
 
         for i in self.series:
             d = self.datas[i]
-            d._name = f'S{i}'  # Set data name for logging
-            
+            d._name = f'S{i}'
+
             # Initialize MAC indicators
             self.sma_fast[d] = bt.ind.SMA(d.close, period=self.p.fast)
             self.sma_slow[d] = bt.ind.SMA(d.close, period=self.p.slow)
             self.cross[d] = bt.ind.CrossOver(self.sma_fast[d], self.sma_slow[d])
-            
+
             # Initialize Bollinger Bands indicators
             bb = bt.ind.BollingerBands(d.close, period=self.p.bb_period, devfactor=self.p.bb_devfactor)
             self.bb_top[d] = bb.top
@@ -78,7 +100,11 @@ class MACBBStrategy(bt.Strategy):
             self.bb_bot[d] = bb.bot
             self.cross_top[d] = bt.ind.CrossOver(d.close, bb.top)
             self.cross_bot[d] = bt.ind.CrossOver(d.close, bb.bot)
-            
+
+            # --- Inverse volatility sizing: avg abs daily change (added) ---
+            self.abschg[d] = AbsChange(d.close)
+            self.avg_abschg[d] = bt.ind.SMA(self.abschg[d], period=self.p.invvol_lookback)
+
             # Initialize state
             self.highest[d] = None
             self.lowest[d] = None
@@ -88,34 +114,82 @@ class MACBBStrategy(bt.Strategy):
             self.order_submit_bar[d] = None
             self.data_idx[d] = i
 
+    # === Inverse volatility sizing helpers (added) ===
+
+    def _compute_invvol_budgets(self):
+        """
+        PDF sizing rule across series:
+        vol_i = avg(|close_t - close_{t-1}|) over lookback
+        raw_i = 1 / vol_i
+        w_i = raw_i / sum(raw)
+        budget_i = w_i * total_exposure
+        """
+        raw = {}
+        for i in self.series:
+            d = self.datas[i]
+            v = float(self.avg_abschg[d][0])
+
+            if math.isnan(v) or v <= 0:
+                continue
+
+            v = max(self.p.min_avg_abs_change, v)
+            raw[d] = 1.0 / v
+
+        s = sum(raw.values())
+        if s <= 0:
+            self.invvol_budget = {}
+            return
+
+        budgets = {}
+        for d, r in raw.items():
+            w = r / s
+            budgets[d] = w * float(self.p.total_exposure)
+
+        self.invvol_budget = budgets
+
     # === Helper Methods ===
 
     def _pos_size(self, d):
-        """ Helper function: Calculate dynamic position size (fixed notional value) """
+        """ Helper function: Calculate dynamic position size """
+        px = float(d.close[0])
+        if px <= 0 or math.isnan(px):
+            return 0
+
+        # --- Inverse volatility sizing (PDF rule) ---
+        if self.p.use_inv_vol_sizing:
+            budget = self.invvol_budget.get(d, None)
+            if budget is not None and budget > 0:
+                units = int(budget // px)
+                units = max(0, min(int(self.p.max_units), units))
+                return units
+            # If budgets not ready yet, fall through to original sizing
+
+        # --- Original sizing (unchanged behaviour) ---
         if self.p.use_dynamic_size:
-            px = float(d.close[0])
-            if px <= 0 or math.isnan(px):
-                return 0
-            # Calculate: $5000 / $price_per_share = num_shares
             return max(0, int(self.p.size_constant // px))
         else:
             return int(self.p.fixed_stake)
 
     def next(self):
         """ Core strategy logic, runs on every bar """
+
+        # --- Inverse volatility budgets updated each bar ---
+        if self.p.use_inv_vol_sizing:
+            self._compute_invvol_budgets()
+
         for i in self.series:
             d = self.datas[i]
-            
+
             # --- Check if limit order has expired (limit order expiration management) ---
             if self.order_pending.get(d) and self.order_submit_bar.get(d) is not None:
                 submit_bar = self.order_submit_bar[d]
                 current_bar = len(self)
                 bar_age = current_bar - submit_bar
-                
+
                 # If order has expired
                 if bar_age >= self.p.limit_valid_bars:
                     self._log(d, f"Limit order expired (age={bar_age} bars).")
-                    
+
                     # Cancel the expired order
                     if self.pending_order.get(d):
                         try:
@@ -126,39 +200,38 @@ class MACBBStrategy(bt.Strategy):
                             # If cancel fails, clean up state
                             self.order_pending[d] = False
                             self.order_submit_bar[d] = None
-                    
+
                     continue  # Skip this iteration, wait for notify_order to handle
-            
+
             # --- Skip if order is pending ---
             if self.order_pending.get(d):
                 continue
-                
+
             pos = self.getposition(d)
             cur = int(pos.size) if pos else 0
             close_px = float(d.close[0])
 
             # --- 1) First layer protection: Trailing stop and fixed take profit ---
             target = None  # Default to None (no action)
-            
+
             # Check prerequisites: Must have position and notify_order has set anchors
             if cur > 0 and self.entry_price[d] is not None and self.highest[d] is not None:
                 # 1a. Update long trailing stop anchor
                 self.highest[d] = max(self.highest[d], close_px)
-                
-                # 1b. Calculate two exit prices
+
+                # # 1b. Calculate two exit prices
                 trail_stop_price = self.highest[d] * (1.0 - self.p.trailing_stop_pct)
-                take_profit_price = self.entry_price[d] * (1.0 + self.p.take_profit_pct)
+                # take_profit_price = self.entry_price[d] * (1.0 + self.p.take_profit_pct)
 
                 # If either is triggered
-                if close_px <= trail_stop_price or close_px >= take_profit_price:
-                    target = 0  # Mark for closing position
-                    reason = "Trail Stop" if close_px <= trail_stop_price else "Take Profit"
-                    self._log(d, f"LONG EXIT via {reason} @ {close_px:.2f}")
+                if close_px <= trail_stop_price:
+                   target = 0
+                   self._log(d, f"LONG EXIT via Trail Stop @ {close_px:.2f}")
 
             elif cur < 0 and self.entry_price[d] is not None and self.lowest[d] is not None:
                 # 1a. Update short trailing stop anchor
                 self.lowest[d] = min(self.lowest[d], close_px)
-                
+
                 # 1b. Calculate two exit prices
                 trail_stop_price = self.lowest[d] * (1.0 + self.p.trailing_stop_pct)
                 take_profit_price = self.entry_price[d] * (1.0 - self.p.take_profit_pct)
@@ -166,8 +239,6 @@ class MACBBStrategy(bt.Strategy):
                 # If either is triggered
                 if close_px >= trail_stop_price or close_px <= take_profit_price:
                     target = 0  # Mark for closing position
-                    reason = "Trail Stop" if close_px >= trail_stop_price else "Take Profit"
-                    self._log(d, f"SHORT EXIT via {reason} @ {close_px:.2f}")
 
             # --- 2) If first layer not triggered, check signals ---
             if target is None:
@@ -175,41 +246,41 @@ class MACBBStrategy(bt.Strategy):
                 c_mac = self.cross[d][0]
                 c_top = self.cross_top[d][0]
                 c_bot = self.cross_bot[d][0]
-                
+
                 # Get state values
                 sma_fast_val = float(self.sma_fast[d][0])
                 sma_slow_val = float(self.sma_slow[d][0])
                 bb_top_val = float(self.bb_top[d][0])
                 bb_bot_val = float(self.bb_bot[d][0])
                 bb_mid_val = float(self.bb_mid[d][0])
-                
+
                 # Calculate mid-band exit threshold (with buffer to prevent whipsaw)
                 mid_exit_threshold_long = bb_mid_val * self.p.mid_band_buffer
                 mid_exit_threshold_short = bb_mid_val * (2 - self.p.mid_band_buffer)  # Symmetric calculation
-                
+
                 # === A) Second layer + Third layer protection: Trend reversal and trend weakening ===
                 if cur > 0:  # Long position
                     # Second layer: MAC death cross (trend reversal)
                     if c_mac < 0:
                         target = 0
                         self._log(d, "LONG EXIT: MAC Death Cross (trend reversal)")
-                    
+
                     # Third layer: Price below mid-band buffer (trend weakening + prevent whipsaw)
                     elif close_px < mid_exit_threshold_long:
                         target = 0
                         self._log(d, f"LONG EXIT: Price Below BB Mid Buffer @ {close_px:.2f} < {mid_exit_threshold_long:.2f}")
-                
+
                 elif cur < 0:  # Short position
                     # Second layer: MAC golden cross (trend reversal)
                     if c_mac > 0:
                         target = 0
                         self._log(d, "SHORT EXIT: MAC Golden Cross (trend reversal)")
-                    
+
                     # Third layer: Price above mid-band buffer (trend weakening + prevent whipsaw)
                     elif close_px > mid_exit_threshold_short:
                         target = 0
                         self._log(d, f"SHORT EXIT: Price Above BB Mid Buffer @ {close_px:.2f} > {mid_exit_threshold_short:.2f}")
-                
+
                 # === B) If no exit signal, check entry conditions ===
                 if target is None:
                     # Method A: MAC event + BB state (recommended)
@@ -217,7 +288,7 @@ class MACBBStrategy(bt.Strategy):
                         size = self._pos_size(d)
                         target = +size
                         self._log(d, "LONG: MAC Golden Cross + Price>BB_Upper")
-                    
+
                     elif c_mac < 0 and close_px < bb_bot_val:
                         if self.p.allow_short:
                             size = self._pos_size(d)
@@ -225,13 +296,13 @@ class MACBBStrategy(bt.Strategy):
                             self._log(d, "SHORT: MAC Death Cross + Price<BB_Lower")
                         else:
                             target = 0
-                    
+
                     # Method B: MAC state + BB event (backup)
                     elif sma_fast_val > sma_slow_val and c_top > 0:
                         size = self._pos_size(d)
                         target = +size
                         self._log(d, "LONG: Fast>Slow + BB Breakout Upper")
-                    
+
                     elif sma_fast_val < sma_slow_val and c_bot < 0:
                         if self.p.allow_short:
                             size = self._pos_size(d)
@@ -239,7 +310,7 @@ class MACBBStrategy(bt.Strategy):
                             self._log(d, "SHORT: Fast<Slow + BB Breakout Lower")
                         else:
                             target = 0
-                    
+
                     else:
                         # No signal
                         target = cur  # Keep current position
@@ -254,7 +325,7 @@ class MACBBStrategy(bt.Strategy):
             if not self.overspend_guard(intents):
                 self._log(d, f"Overspend guard! Skip order delta={delta}")
                 continue
-            
+
             # Submit order (market or limit) - inline logic from _place_order
             if not self.p.use_limit_orders:
                 # Use market order
@@ -272,16 +343,16 @@ class MACBBStrategy(bt.Strategy):
                     limit_price = close_px * (1 + self.p.limit_offset_pct)
                     self.place_limit(d, delta, price=limit_price)
                     self._log(d, f"Limit SELL: delta={delta}, price={limit_price:.4f} (valid {self.p.limit_valid_bars} bars)")
-                
+
                 # Record order info (for expiration management)
                 self.order_submit_bar[d] = len(self)
-            
+
             # Lock state after order submission to prevent duplicate orders
             self.order_pending[d] = True
 
     def notify_order(self, order):
         d = order.data
-        
+
         # Record order object (for cancellation)
         if order.status in [order.Submitted, order.Accepted]:
             self.pending_order[d] = order
@@ -305,21 +376,21 @@ class MACBBStrategy(bt.Strategy):
             self._log(d, f"{action} EXEC ({order_type}) @ {exe_price:.6f} size={exe_size}")
 
             cur_pos = self.getposition(d).size
-            
+
             if cur_pos != 0:
                 # This is an entry/reverse order
                 self._log(d, f"NEW ENTRY @ {exe_price:.2f}. Setting anchors.")
                 # 1. Record actual entry price (for fixed take profit)
                 self.entry_price[d] = exe_price
-                
+
                 # 2. Set trailing stop initial anchors
                 if cur_pos > 0:
                     self.highest[d] = exe_price
-                    self.lowest[d] = None 
+                    self.lowest[d] = None
                 else:
                     self.lowest[d] = exe_price
                     self.highest[d] = None
-            
+
             else:
                 # This is a closing order
                 self._log(d, "POSITION CLOSED. Anchors cleared.")
