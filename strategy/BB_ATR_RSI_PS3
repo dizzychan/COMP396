@@ -1,0 +1,384 @@
+import math
+import datetime
+import backtrader as bt
+
+
+class AbsChange(bt.Indicator):
+    """
+    |close_t - close_{t-1}| for the series.
+    Used to compute average absolute daily price change (vol proxy).
+    """
+    lines = ("abschg",)
+
+    def __init__(self):
+        self.l.abschg = abs(self.data0 - self.data0(-1))
+
+
+class AbsPctChange(bt.Indicator):
+    """
+    |close_t / close_{t-1} - 1| for the series.
+    Used to compute average absolute daily percentage change (vol proxy).
+    """
+    lines = ("abspct",)
+
+    def __init__(self):
+        prev = self.data0(-1)
+        self.l.abspct = bt.If(prev != 0.0, abs(self.data0 / prev - 1.0), 0.0)
+
+
+class Bollinger(bt.Strategy):
+    params = (
+        ("stake", 10),  # fallback units (used if inv-vol disabled or budgets not ready)
+        ("n", 20),
+        ("k", 2.0),
+        ("allow_short", True),  # Enable short selling
+
+        # RSI
+        ("allow_RSI", True),  # Enable RSI usage
+        ("RSI_period", 14),   # RSI period
+        ("RSI_buy", 35),      # Buy only when RSI < 35 and breaks lower band
+        ("RSI_sell", 65),     # Sell only when RSI > 65 and breaks upper band
+
+        # Stop Loss and take profit
+        ("exit_rule", True),   # Enable stop loss and take profit
+        ("Stop_loss", 0.10),   # Stop loss
+        ("take_profit", 0.20), # Take profit
+        ("atr_period", 14),
+        ("atr_sl_mult", 2.0),
+
+        # --- Inverse Volatility Sizing ---
+        ("use_inv_vol_sizing", True),
+        ("invvol_lookback", 20),
+        ("total_exposure", 1_000_000.0),
+        ("min_avg_abs_change", 1e-8),
+        ("max_units", 100000),
+
+        # --- Regime filter ] ---
+        ("use_regime_filter", True),
+        ("regime_ma_period", 200),          # long-term baseline
+        ("regime_slope_lookback", 20),      # slope lookback bars
+        ("regime_slope_thresh_pct", 0.002), # 0.2% MA move over lookback window
+
+        # ADX needs high/low. Your data feed likely doesn't have them.
+        #("use_adx_filter", False),
+        #("adx_period", 14),
+        #("adx_max", 20.0),
+
+        # --- Restrict shorts ---
+        ("restrict_shorts", True),
+        ("short_only_if_downtrend", True),  # short only if close < MA and slope < 0
+        ("short_size_mult", 0.5),           # shorts smaller than longs
+    )
+
+    def _dname(self, d):
+        return getattr(d, "_name", str(d))
+
+    def _log(self, d, txt):
+        dt = d.datetime.date(0)
+        print(f"{dt} [{self._dname(d)}] {txt}")
+
+    def start(self):
+        self.mid = {}
+        self.std = {}
+        self.upper = {}
+        self.lower = {}
+        self.rsi = {}
+        self.atr = {}
+
+        # --- Regime filter state ---
+        self.regime_ma = {}
+        self.regime_slope = {}
+        self.adx = {}
+
+        # --- Inverse vol sizing state ---
+        self.abschg = {}
+        self.avg_abschg = {}
+        self.invvol_budget = {}
+
+        for d in self.datas:
+            # 为每个数据 d 计算布林带和 RSI
+            self.mid[d] = bt.indicators.SMA(d.close, period=int(self.p.n))
+            self.std[d] = bt.indicators.StandardDeviation(d.close, period=int(self.p.n))
+            self.upper[d] = self.mid[d] + float(self.p.k) * self.std[d]
+            self.lower[d] = self.mid[d] - float(self.p.k) * self.std[d]
+            self.atr[d] = bt.indicators.ATR(d, period=int(self.p.atr_period))
+
+            if self.p.allow_RSI:
+                self.rsi[d] = bt.indicators.RSI(d.close, period=int(self.p.RSI_period))
+            else:
+                self.rsi[d] = None
+
+            # --- Regime filter indicators ---
+            self.regime_ma[d] = bt.indicators.SMA(d.close, period=int(self.p.regime_ma_period))
+
+            # Slope proxy: percentage change in MA over lookback (close-only friendly)
+            lb = int(self.p.regime_slope_lookback)
+            ma_now = self.regime_ma[d]
+            ma_prev = self.regime_ma[d](-lb)
+            self.regime_slope[d] = bt.If(ma_prev != 0.0, (ma_now - ma_prev) / ma_prev, 0.0)
+
+            # ADX requires high/low, so disable on close-only data
+            self.adx[d] = None
+
+            # --- Inverse vol sizing indicators ---
+            self.abschg[d] = AbsPctChange(d.close)
+            self.avg_abschg[d] = bt.ind.SMA(self.abschg[d], period=int(self.p.invvol_lookback))
+
+    def entry_filters_pass_RSI(self, d, side):
+        if not self.p.allow_RSI or self.rsi[d] is None:
+            return True
+
+        rsi_val = self.rsi[d][0]
+        if math.isnan(rsi_val):
+            return False
+
+        rsi_now = float(rsi_val)
+        if side == "long":
+            return rsi_now <= float(self.p.RSI_buy)
+        else:  # short
+            return rsi_now >= float(self.p.RSI_sell)
+
+    # --- Regime filter + short restriction helpers ---
+    def _is_trending_regime(self, d):
+        """
+        Returns True if we consider the market 'trending' (bad for mean reversion entries).
+        Close-only version: uses percentage MA slope.
+        """
+        if not self.p.use_regime_filter:
+            return False
+
+        slope_pct = float(self.regime_slope[d][0])
+        if math.isnan(slope_pct):
+            return True  # conservative early on
+
+        # If MA has moved more than threshold over lookback, call it trending
+        return abs(slope_pct) > float(self.p.regime_slope_thresh_pct)
+
+    def _short_allowed(self, d):
+        """
+        Restrict shorts to downtrends only (helps PD a lot in drifting markets).
+        Close-only version: downtrend means close < MA and slope_pct < 0.
+        """
+        if not self.p.allow_short:
+            return False
+        if not self.p.restrict_shorts:
+            return True
+        if not self.p.short_only_if_downtrend:
+            return True
+
+        ma = float(self.regime_ma[d][0])
+        slope_pct = float(self.regime_slope[d][0])
+        close_px = float(d.close[0])
+
+        if any(map(math.isnan, [ma, slope_pct, close_px])):
+            return False
+
+        return (close_px < ma) and (slope_pct < 0.0)
+
+    def exit_hit(self, d, close_px, pos_size, pos_price):
+        if not self.p.exit_rule or pos_size == 0 or pos_price is None or pos_price <= 0:
+            return (False, 0)
+
+        sl_pct = float(self.p.Stop_loss)
+        tp_pct = float(self.p.take_profit)
+
+        # 获取当前数据的 ATR 值
+        atr_now = self.atr[d][0]
+        atr_mult = float(self.p.atr_sl_mult)
+
+        if pos_size > 0:  # 多头持仓
+            # 计算固定百分比止损价
+            sl_fixed = pos_price * (1.0 - sl_pct)
+            # 计算 ATR 动态止损价
+            sl_atr = pos_price - (atr_now * atr_mult)
+            # 取两者中较高的价格（最紧的止损）
+            final_sl = max(sl_fixed, sl_atr)
+
+            stop_loss_hit = close_px <= final_sl
+            take_profit_hit = close_px >= pos_price * (1.0 + tp_pct)
+
+            if stop_loss_hit or take_profit_hit:
+                return (True, -pos_size)
+
+        else:  # 空头持仓
+            # 计算固定百分比止损价
+            sl_fixed = pos_price * (1.0 + sl_pct)
+            # 计算 ATR 动态止损价
+            sl_atr = pos_price + (atr_now * atr_mult)
+            # 取两者中较低的价格（最紧的止损）
+            final_sl = min(sl_fixed, sl_atr)
+
+            stop_loss_hit = close_px >= final_sl
+            take_profit_hit = close_px <= pos_price * (1.0 - tp_pct)
+
+            if stop_loss_hit or take_profit_hit:
+                return (True, -pos_size)
+
+        return (False, 0)
+
+    # --- Inverse volatility sizing helpers ---
+    def _compute_invvol_budgets(self):
+        """
+        vol_i = avg(|close_t - close_{t-1}|) over lookback
+        raw_i = 1 / vol_i
+        w_i = raw_i / sum(raw)
+        budget_i = w_i * total_exposure
+        """
+        raw = {}
+        for d in self.datas:
+            v = float(self.avg_abschg[d][0])
+            if math.isnan(v) or v <= 0:
+                continue
+
+            v = max(float(self.p.min_avg_abs_change), v)
+            raw[d] = 1.0 / v
+
+        s = sum(raw.values())
+        if s <= 0:
+            # keep previous budgets (do not wipe) so behaviour is stable early on
+            return
+
+        budgets = {}
+        total = float(self.p.total_exposure)
+        for d, r in raw.items():
+            w = r / s
+            budgets[d] = w * total
+
+        self.invvol_budget = budgets
+
+    def _pos_size(self, d):
+        """Return units for this data feed (inv-vol if enabled, else stake)."""
+        px = float(d.close[0])
+        if px <= 0 or math.isnan(px):
+            return 0
+
+        if self.p.use_inv_vol_sizing:
+            budget = self.invvol_budget.get(d, None)
+            if budget is not None and budget > 0:
+                units = int(budget // px)
+                units = max(0, min(int(self.p.max_units), units))
+                return units
+
+        return int(self.p.stake)
+
+    def _limit_order(self, data, size, limit_price):
+        #  Budget check (This is an extra order, must check)
+        if not self.overspend_guard([(data, size)]):
+            return
+
+        # Set validity to 1 day (Day Order)
+        valid_until = data.datetime.date(0) + datetime.timedelta(days=1)
+
+        # Send limit order
+        if size > 0:
+            self.buy(data=data, size=size, price=limit_price, exectype=bt.Order.Limit, valid=valid_until)
+        elif size < 0:
+            self.sell(data=data, size=size, price=limit_price, exectype=bt.Order.Limit, valid=valid_until)
+
+        self._log(data, f"EXTRA LIMIT PLACED: {size} @ {limit_price:.2f}")
+
+    # ---------- Main ----------
+    def next(self):
+        # --- Inverse volatility budgets updated each bar ---
+        if self.p.use_inv_vol_sizing:
+            self._compute_invvol_budgets()
+
+        for d in self.datas:
+            # Get current indicator values
+            BB_up = float(self.upper[d][0]) if not math.isnan(self.upper[d][0]) else None
+            BB_low = float(self.lower[d][0]) if not math.isnan(self.lower[d][0]) else None
+
+            if BB_up is None or BB_low is None:
+                continue
+
+            bandwidth = BB_up - BB_low
+            close_px = float(d.close[0])
+            pos = self.getposition(d)
+            cur_pos = int(pos.size)
+            avg_px = float(pos.price) if pos.size != 0 else None
+
+            # SL/TP check (Keep as is - must use Market order for safety)
+            hit, delta_exit = self.exit_hit(d, close_px, cur_pos, avg_px)
+            if hit and delta_exit != 0:
+                intents = [(d, delta_exit)]
+                if not self.overspend_guard(intents):
+                    self._log(d, "Overspend guard triggered on exit; skip order")
+                    continue
+                self.place_market(d, delta_exit)
+                self._log(
+                    d,
+                    f"EXIT via SL/TP: close={close_px:.4f} avg={avg_px:.4f} | pos={cur_pos:+d}, delta={delta_exit:+d}",
+                )
+                continue
+
+            # Regime filter (added)
+            trending = self._is_trending_regime(d)
+
+            # Generate trading signals
+            delta = 0
+            size = self._pos_size(d)  # (added) dynamic size per series
+
+            if size <= 0:
+                continue
+
+            # If trending, skip mean reversion entries (but still allow exits above)
+            if trending:
+                continue
+
+            # Break below lower band -> Long
+            if close_px < BB_low:
+                if self.entry_filters_pass_RSI(d, "long"):
+                    delta = +int(size)
+
+            # Break above upper band  -> Short (restricted)
+            elif close_px > BB_up:
+                if self._short_allowed(d):
+                    if self.entry_filters_pass_RSI(d, "short"):
+                        short_size = int(int(size) * float(self.p.short_size_mult))
+                        if short_size > 0:
+                            delta = -short_size
+                else:
+                    if cur_pos > 0:
+                        delta = -min(int(size), cur_pos)
+
+            if delta == 0:
+                continue
+
+            #  Execute trade
+            # Market order
+            intents = [(d, delta)]
+            if not self.overspend_guard(intents):
+                self._log(d, "Overspend guard triggered; skip order")
+                continue
+
+            self.place_market(d, delta)
+            self._log(d, f"MARKET ORDER: {delta} @ {close_px:.2f}")
+
+            #  Limit order
+            #  Attempt limit order entry only when opening a position (0 pos)
+            if cur_pos == 0:
+                # Strategy: Determine depth based on bandwidth (volatility)
+                # Buffer distance set to 10% of bandwidth (0.1)
+                # The wilder the market (wider band), the further we limit, higher safety margin
+                buffer = bandwidth * 0.1
+                if delta > 0:  # Buy
+                    # Limit price at Lower Band - Buffer
+                    limit_price = BB_low - buffer
+                else:  # Sell
+                    # Limit price at Upper Band + Buffer
+                    limit_price = BB_up + buffer
+
+                self._limit_order(d, delta, limit_price)
+
+    # ---------- 订单回调 ----------
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+        d = order.data
+        if order.status in [order.Completed]:
+            action = "BUY" if order.isbuy() else "SELL"
+            self._log(d, f"{action} executed at {order.executed.price:.2f} for size {order.executed.size}")
+        elif order.status in [order.Canceled]:
+            self._log(d, "Order Canceled")
+        elif order.status in [order.Rejected]:
+            self._log(d, "Order Rejected")
