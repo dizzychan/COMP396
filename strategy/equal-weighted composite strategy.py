@@ -12,7 +12,6 @@ class AbsPctChange(bt.Indicator):
 
 class EnsembleVoteB(bt.Strategy):
     """
-    Scheme B:
     - Entry by weighted vote of MACBB, BBRSI, MACD signals.
     - Exit if any sub-strategy exit rule triggers.
     """
