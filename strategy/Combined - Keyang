@@ -1,13 +1,15 @@
+
 import backtrader as bt
-import math
+import datetime
 
 
-# ============================================================
-# 1. Indicators (基础指标)
-# ============================================================
+# -----------------------------------------------------------------------------
+# 1. 基础指标
+# -----------------------------------------------------------------------------
 
 class AbsPctChange(bt.Indicator):
     lines = ("abspct",)
+    params = (('period', 1),)
 
     def __init__(self):
         prev = self.data0(-1)
@@ -15,7 +17,6 @@ class AbsPctChange(bt.Indicator):
 
 
 class BBandWidth(bt.Indicator):
-    """ 计算布林带宽度，用于判断波动率 """
     lines = ('width',)
     params = (('period', 20), ('devfactor', 2.0),)
 
@@ -24,270 +25,311 @@ class BBandWidth(bt.Indicator):
         self.lines.width = bt.If(bb.mid != 0, (bb.top - bb.bot) / bb.mid, 0.0)
 
 
-# ============================================================
-# 2. Strategy Class
-# ============================================================
 
-class TeamStrategy(bt.Strategy):
+
+class EliteSniperStrategy(bt.Strategy):
     params = dict(
         printlog=True,
 
-        # --- 资金管理 ---
-        total_equity=1_000_000.0,
-        target_volatility=0.035,  # 3.5% 风险敞口
-        max_units=1_000_000,
-        invvol_lookback=20,
+        # --- [风控] ---
+        risk_total_budget=20000.0,
+        risk_per_trade_cap=0.015,
+        risk_atr_period=14,
 
-        # --- 特征识别参数 (The Brain) ---
+        # [出场] 稍微降低止盈预期，提高胜率
+        take_profit_mult=3.0,  # [V6] 3.5 -> 3.0 (更容易落袋)
+        breakeven_trigger_mult=0.8,  # [V6] 1.0 -> 0.8 (更快保本)
+
+        # --- [特征识别] 门槛大幅降低 ---
         adx_period=14,
-        adx_threshold=25,  # 趋势/震荡的分界线
-        bbw_period=20,  # 用来判断波动率高低
+        adx_threshold=20,  # [V6] 30 -> 20 (弱趋势也做)
+        bbw_period=20,
+        bbw_upper_mult=1.4,  # [V6] 1.5 -> 1.4 (更容易判定为震荡)
 
-        # --- T策略 (Trend - 强趋势专用) ---
-        t_fast=10, t_slow=30,
-        t_limit_offset=0.002,  # 趋势回调买入
-        t_validity=1,
+        #  Trend 
+        t_ma_filter=200,
+        t_fast=20, t_slow=60,
+        t_pullback_atr=0.3,  # [V6] 0.6 -> 0.3 (浅回调就买)
+        t_validity=3,
 
-        # --- B策略 (Bollinger - 宽幅震荡专用) ---
-        b_period=20, b_dev=2.0,
-        b_rsi_period=14, b_rsi_buy=35, b_rsi_sell=65,
-        b_limit_buffer=0.1,  # 深坑接飞刀
+        # Bollinger 
+        b_period=20,
+        b_dev=2.4,  # [V6] 2.5 -> 2.4 (更容易触碰)
+        b_rsi_buy=35,  # [V6] 30 -> 35
+        b_rsi_sell=65,
+        b_limit_buffer_atr=0.1,  # [V6] 挂单更激进
+        b_validity=2,
 
-        # --- M策略 (Momentum - 挤压突破专用) ---
+        # Momentum 
         m_fast=12, m_slow=26, m_sig=9,
-        m_atr_mult=0.3,  # 突破加仓
+        m_breakout_atr_mult=0.2,  # [V6] 追涨更紧
+        m_trend_filter=20,  # [V6 核心] 60 -> 20 (只要在中轨之上就敢做)
+        m_vol_mult=1.1,  # [V6 核心] 1.5 -> 1.1 (微放量即可)
+        m_validity=1,
 
-        # --- 风控参数 ---
-        atr_period=14,
-        stop_loss_trend=3.5,  # 趋势模式宽止损
-        stop_loss_range=1.5,  # 震荡模式窄止损
-        cooldown=3,
+        # 止损设置 
+        stop_mult_trend=2.0,  # [V6] 2.5 -> 2.0
+        stop_mult_range=1.5,
+        max_units=100000,
+        cooldown=2,  # [V6] 5 -> 2 (快速重返战场)
     )
 
     def __init__(self):
-        self.inds = {}
-        self.orders = {}
-        self.trade_source = {}  # 记录这笔交易是由谁(T/M/B)发起的
+        # 状态管理
+        self.order_pending = {}
+        self.trade_source = {}
         self.cooldown_timer = {}
+        self.risk_alloc = {}
+        self.trade_entry_price = {}
+        self.trade_stop_price = {}
+        self.is_breakeven_set = {}
+        self.inds = {}
 
         for d in self.datas:
-            self.inds[d] = {}
-            self.orders[d] = []
+            self.order_pending[d] = False
             self.trade_source[d] = None
             self.cooldown_timer[d] = 0
+            self.trade_entry_price[d] = None
+            self.trade_stop_price[d] = None
+            self.is_breakeven_set[d] = False
+            self.inds[d] = {}
 
-            # --- 1. 特征指标 (指挥官) ---
+            # --- 指标 ---
             self.inds[d]['adx'] = bt.ind.ADX(d, period=self.p.adx_period)
             self.inds[d]['bbw'] = BBandWidth(d, period=self.p.bbw_period)
-            # 计算 BBW 的移动平均，用于判断当前波动率是高还是低
             self.inds[d]['avg_bbw'] = bt.ind.SMA(self.inds[d]['bbw'], period=50)
+            self.inds[d]['atr'] = bt.ind.ATR(d, period=self.p.risk_atr_period)
+            self.inds[d]['vol_proxy'] = bt.ind.SMA(AbsPctChange(d.close), period=20)
+            self.inds[d]['vol'] = d.volume
+            self.inds[d]['vol_ma'] = bt.ind.SMA(d.volume, period=20)
 
-            # --- 2. 资金/风控指标 ---
-            self.inds[d]['atr'] = bt.ind.ATR(d, period=self.p.atr_period)
-            self.inds[d]['vol_calc'] = bt.ind.SMA(AbsPctChange(d.close), period=self.p.invvol_lookback)
+            # [滤网]
+            self.inds[d]['ma_200'] = bt.ind.SMA(d.close, period=self.p.t_ma_filter)
+            self.inds[d]['ma_20'] = bt.ind.SMA(d.close, period=self.p.m_trend_filter)  # V6 改为 MA20
 
-            # --- 3. 战术指标 (T/M/B) ---
-            # T: 均线
-            self.inds[d]['sma_f'] = bt.ind.SMA(d.close, period=self.p.t_fast)
-            self.inds[d]['sma_s'] = bt.ind.SMA(d.close, period=self.p.t_slow)
-            self.inds[d]['t_cross'] = bt.ind.CrossOver(self.inds[d]['sma_f'], self.inds[d]['sma_s'])
+            # 战术指标
+            sma_f = bt.ind.SMA(d.close, period=self.p.t_fast)
+            sma_s = bt.ind.SMA(d.close, period=self.p.t_slow)
+            self.inds[d]['t_cross'] = bt.ind.CrossOver(sma_f, sma_s)
 
-            # B: 布林+RSI
             self.inds[d]['bb'] = bt.ind.BollingerBands(d.close, period=self.p.b_period, devfactor=self.p.b_dev)
-            self.inds[d]['rsi'] = bt.ind.RSI(d.close, period=self.p.b_rsi_period)
+            self.inds[d]['rsi'] = bt.ind.RSI(d.close, period=14)
 
-            # M: MACD
-            self.inds[d]['macd'] = bt.ind.MACD(d.close, period_me1=self.p.m_fast, period_me2=self.p.m_slow,
-                                               period_signal=self.p.m_sig)
+            self.inds[d]['macd'] = bt.ind.MACD(d.close)
             self.inds[d]['m_cross'] = bt.ind.CrossOver(self.inds[d]['macd'].macd, self.inds[d]['macd'].signal)
 
-            # 状态锚点
-            self.inds[d]['highest'] = None
-            self.inds[d]['lowest'] = None
+    # -------------------------------------------------------------------------
+    # 辅助逻辑
+    # -------------------------------------------------------------------------
 
-    def log(self, txt, dt=None):
+    def log_data(self, d, txt):
         if self.p.printlog:
-            dt = dt or self.datas[0].datetime.date(0)
-            print(f"{dt} {txt}")
+            try:
+                dt = d.datetime.date(0)
+                d_name = getattr(d, '_name', 'Data')
+                print(f"{dt} [{d._name}] {txt}")
+            except:
+                pass
 
-    # --- 核心：特征识别与指挥 (Feature Logic) ---
-    def determine_regime(self, d):
+    def _determine_regime(self, d):
         adx = self.inds[d]['adx'][0]
         bbw = self.inds[d]['bbw'][0]
         avg_bbw = self.inds[d]['avg_bbw'][0]
+        close = d.close[0]
+        ma_200 = self.inds[d]['ma_200'][0]
 
-        # 1. 强趋势体制 (Trend Regime)
+        # 门槛降低
         if adx > self.p.adx_threshold:
-            return 'TREND'
+            if close > ma_200:
+                return 'TREND'
+            return None
 
-        # 2. 震荡体制 (Range Regime) - 波动率高于平均
-        elif bbw > avg_bbw:
+        elif bbw > (avg_bbw * self.p.bbw_upper_mult):
             return 'VOLATILE'
 
-        # 3. 挤压/突破体制 (Squeeze Regime) - 波动率低，酝酿突破
-        else:
+        elif bbw < (avg_bbw * 0.8):
             return 'SQUEEZE'
 
-    def get_size(self, d):
-        vol = self.inds[d]['vol_calc'][0]
-        if vol <= 0: return 0
-        risk_alloc = self.p.total_equity / len(self.datas) * self.p.target_volatility
-        size = int(risk_alloc / vol / d.close[0])
-        return min(size, self.p.max_units)
+        return None
 
-    def check_exit(self, d, pos_size):
-        if pos_size == 0:
-            self.inds[d]['highest'] = None
-            self.inds[d]['lowest'] = None
-            self.trade_source[d] = None
-            return False
+    def _calc_risk_budgets(self):
+        raw_weights = {}
+        total_inv_vol = 0.0
+        for d in self.datas:
+            vol = self.inds[d]['vol_proxy'][0]
+            if vol <= 0: continue
+            w = 1.0 / max(1e-8, vol)
+            raw_weights[d] = w
+            total_inv_vol += w
+        self.risk_alloc = {}
+        if total_inv_vol > 0:
+            for d, w in raw_weights.items():
+                self.risk_alloc[d] = (w / total_inv_vol) * self.p.risk_total_budget
 
-        px = d.close[0]
+    def _get_size(self, d, stop_mult):
+        budget = self.risk_alloc.get(d, 0.0)
         atr = self.inds[d]['atr'][0]
+        if budget <= 0 or atr <= 0: return 0
+        max_risk = self.broker.getvalue() * self.p.risk_per_trade_cap
+        budget = min(budget, max_risk)
+        stop_dist = atr * stop_mult
+        if stop_dist == 0: return 0
+        units = int(budget // stop_dist)
+        return min(units, self.p.max_units)
+
+    # -------------------------------------------------------------------------
+    # 
+    # -------------------------------------------------------------------------
+
+    def _run_t_strategy(self, d):
+        cross = self.inds[d]['t_cross'][0]
+        if cross <= 0: return
+
+        size = self._get_size(d, self.p.stop_mult_trend)
+        if size == 0: return
+
+        valid = d.datetime.date(0) + datetime.timedelta(days=self.p.t_validity)
+        atr = self.inds[d]['atr'][0]
+
+        # 0.3 ATR 浅回调
+        price = d.close[0] - (atr * self.p.t_pullback_atr)
+
+        self.buy(data=d, size=size, price=price, exectype=bt.Order.Limit, valid=valid)
+        self.log_data(d, f"[TREND] Active Entry. Limit BUY @ {price:.2f}")
+
+        self.trade_source[d] = 'T'
+        self.order_pending[d] = True
+
+    def _run_b_strategy(self, d):
+        bb = self.inds[d]['bb']
+        rsi = self.inds[d]['rsi'][0]
+        close = d.close[0]
+        atr = self.inds[d]['atr'][0]
+
+        # [V6] 门槛降低：Dev 2.4, RSI 35
+        if close < bb.bot[0] and rsi < self.p.b_rsi_buy:
+            size = self._get_size(d, self.p.stop_mult_range)
+            if size == 0: return
+
+            # [V6] 挂单就在下轨附近
+            price = bb.bot[0] - (atr * self.p.b_limit_buffer_atr)
+            valid = d.datetime.date(0) + datetime.timedelta(days=self.p.b_validity)
+
+            self.buy(data=d, size=size, price=price, exectype=bt.Order.Limit, valid=valid)
+            self.log_data(d, f"[VOLATILE] Dip Buy. Limit @ {price:.2f}")
+            self.trade_source[d] = 'B'
+            self.order_pending[d] = True
+
+    def _run_m_strategy(self, d):
+        cross = self.inds[d]['m_cross'][0]
+        # [V6] 1.1倍成交量 (微放量)
+        vol_spike = self.inds[d]['vol'][0] > (self.inds[d]['vol_ma'][0] * self.p.m_vol_mult)
+        # [V6] 只要在 MA20 之上就敢做
+        trend_ok = d.close[0] > self.inds[d]['ma_20'][0]
+
+        if cross > 0 and vol_spike and trend_ok:
+            size = self._get_size(d, self.p.stop_mult_trend)
+            if size == 0: return
+
+            valid = d.datetime.date(0) + datetime.timedelta(days=self.p.m_validity)
+            atr = self.inds[d]['atr'][0]
+
+            self.buy(data=d, size=size, exectype=bt.Order.Market)
+            limit_px = d.close[0] - (atr * self.p.m_breakout_atr_mult)
+            self.buy(data=d, size=size // 2, price=limit_px, exectype=bt.Order.Limit, valid=valid)
+            self.log_data(d, f"[SQUEEZE] Active Breakout. BUY (Mkt + Lim)")
+
+            self.trade_source[d] = 'M'
+            self.order_pending[d] = True
+
+    # -------------------------------------------------------------------------
+    # 出场与风控
+    # -------------------------------------------------------------------------
+
+    def _check_exits(self, d, pos):
         source = self.trade_source[d]
+        close = d.close[0]
+        atr = self.inds[d]['atr'][0]
+        entry = self.trade_entry_price[d]
 
-        # 动态止损逻辑：
-        # 如果是 B (震荡) 进场的，用窄止损 (1.5)
-        # 如果是 T/M (趋势/动量) 进场的，用宽止损 (3.5)
-        sl_mult = self.p.stop_loss_range if source == 'B' else self.p.stop_loss_trend
+        if entry is None or atr <= 0: return False
 
-        exit_sig = False
-        if pos_size > 0:
-            self.inds[d]['highest'] = max(self.inds[d]['highest'] or px, px)
-            stop = self.inds[d]['highest'] - (atr * sl_mult)
-            if px < stop: exit_sig = True
-        else:
-            self.inds[d]['lowest'] = min(self.inds[d]['lowest'] or px, px)
-            stop = self.inds[d]['lowest'] + (atr * sl_mult)
-            if px > stop: exit_sig = True
-
-        if exit_sig:
+        # 1. 动态止盈
+        profit_dist = close - entry if pos.size > 0 else entry - close
+        if profit_dist > (atr * self.p.take_profit_mult):
             self.close(data=d)
-            self.cooldown_timer[d] = self.p.cooldown
-            self.log(f"[{d._name}] STOP LOSS ({source}). Cooldown activated.")
+            self.log_data(d, f"[EXIT] Quick Target Hit (+{self.p.take_profit_mult} ATR).")
             return True
+
+        # 2. 保本逻辑 (0.8 ATR 快速保本)
+        if not self.is_breakeven_set[d]:
+            if profit_dist > (atr * self.p.breakeven_trigger_mult):
+                self.trade_stop_price[d] = entry
+                self.is_breakeven_set[d] = True
+                self.log_data(d, "[RISK] Quick Breakeven Locked.")
+
+        # 3. B策略中轨出场
+        if source == 'B':
+            mid = self.inds[d]['bb'].mid[0]
+            if (pos.size > 0 and close >= mid):
+                self.close(data=d)
+                self.log_data(d, "[EXIT] B-Strategy Mid-Band.")
+                return True
+
+        # 4. 止损
+        stop_price = self.trade_stop_price[d]
+        if stop_price is None:
+            mult = self.p.stop_mult_range if source == 'B' else self.p.stop_mult_trend
+            if pos.size > 0:
+                self.trade_stop_price[d] = entry - (atr * mult)
+            else:
+                self.trade_stop_price[d] = entry + (atr * mult)
+            stop_price = self.trade_stop_price[d]
+
+        if pos.size > 0:
+            if close < stop_price:
+                self.close(data=d)
+                self.cooldown_timer[d] = self.p.cooldown
+                self.log_data(d, f"[EXIT] Stop Loss.")
+                return True
         return False
 
     def next(self):
+        self._calc_risk_budgets()
         for d in self.datas:
-            # 1. 冷却与订单检查
             if self.cooldown_timer[d] > 0:
                 self.cooldown_timer[d] -= 1
                 continue
-            if len(self.orders[d]) > 0:
+            if self.order_pending[d]:
+                continue
+            pos = self.getposition(d)
+            if pos.size != 0:
+                self._check_exits(d, pos)
                 continue
 
-            pos = self.getposition(d)
-            if self.check_exit(d, pos.size): continue
-
-            # ========================================
-            # 策略调度层 (Commander Layer)
-            # ========================================
-
-            # 只有空仓时才做开仓决策
-            if pos.size == 0:
-                base_size = self.get_size(d)
-                if base_size == 0: continue
-
-                # 获取当前市场特征
-                regime = self.determine_regime(d)
-
-                # --- 场景 1: 强趋势 (派 T 部队) ---
-                if regime == 'TREND':
-                    if self.inds[d]['t_cross'][0] > 0:  # 金叉
-                        limit_price = d.close[0] * (1.0 - self.p.t_limit_offset)
-                        o = self.buy(data=d, size=base_size, price=limit_price, exectype=bt.Order.Limit,
-                                     valid=self.p.t_validity)
-                        self.orders[d].append(o)
-                        self.trade_source[d] = 'T'
-                        self.log(f"[{d._name}] [TREND MODE] T-Strategy Buy Limit @ {limit_price:.2f}")
-
-                    elif self.inds[d]['t_cross'][0] < 0:  # 死叉
-                        limit_price = d.close[0] * (1.0 + self.p.t_limit_offset)
-                        o = self.sell(data=d, size=base_size, price=limit_price, exectype=bt.Order.Limit,
-                                      valid=self.p.t_validity)
-                        self.orders[d].append(o)
-                        self.trade_source[d] = 'T'
-                        self.log(f"[{d._name}] [TREND MODE] T-Strategy Sell Limit @ {limit_price:.2f}")
-
-                # --- 场景 2: 宽幅震荡 (派 B 部队) ---
-                elif regime == 'VOLATILE':
-                    # 下轨 + 超卖
-                    if d.close[0] < self.inds[d]['bb'].bot[0] and self.inds[d]['rsi'][0] < self.p.b_rsi_buy:
-                        # 震荡市不能无脑接飞刀，这里只挂深坑单，不打市价单，非常保守
-                        bandwidth = self.inds[d]['bb'].top[0] - self.inds[d]['bb'].bot[0]
-                        deep_price = self.inds[d]['bb'].bot[0] - (bandwidth * self.p.b_limit_buffer)
-
-                        # 只有当均线没有大幅下跌时才接（防暴跌）
-                        if d.close[0] > self.inds[d]['sma_s'][0] * 0.95:
-                            o = self.buy(data=d, size=base_size, price=deep_price, exectype=bt.Order.Limit, valid=2)
-                            self.orders[d].append(o)
-                            self.trade_source[d] = 'B'
-                            self.log(f"[{d._name}] [VOLATILE MODE] B-Strategy Deep Limit @ {deep_price:.2f}")
-
-                    # 上轨 + 超买
-                    elif d.close[0] > self.inds[d]['bb'].top[0] and self.inds[d]['rsi'][0] > self.p.b_rsi_sell:
-                        bandwidth = self.inds[d]['bb'].top[0] - self.inds[d]['bb'].bot[0]
-                        deep_price = self.inds[d]['bb'].top[0] + (bandwidth * self.p.b_limit_buffer)
-
-                        if d.close[0] < self.inds[d]['sma_s'][0] * 1.05:
-                            o = self.sell(data=d, size=base_size, price=deep_price, exectype=bt.Order.Limit, valid=2)
-                            self.orders[d].append(o)
-                            self.trade_source[d] = 'B'
-                            self.log(f"[{d._name}] [VOLATILE MODE] B-Strategy Deep Limit @ {deep_price:.2f}")
-
-                # --- 场景 3: 挤压/突破 (派 M 部队) ---
-                elif regime == 'SQUEEZE':
-                    # MACD 金叉试图捕捉突破
-                    if self.inds[d]['m_cross'][0] > 0:
-                        # 突破要果断，市价入场
-                        o1 = self.buy(data=d, size=base_size, exectype=bt.Order.Market)
-                        self.orders[d].append(o1)
-                        # 突破后常有回踩，挂单加仓
-                        limit_deep = d.close[0] - (self.inds[d]['atr'][0] * self.p.m_atr_mult)
-                        o2 = self.buy(data=d, size=base_size // 2, price=limit_deep, exectype=bt.Order.Limit, valid=1)
-                        self.orders[d].append(o2)
-
-                        self.trade_source[d] = 'M'
-                        self.log(f"[{d._name}] [SQUEEZE MODE] M-Strategy Breakout! Market + Limit")
-
-                    elif self.inds[d]['m_cross'][0] < 0:
-                        o1 = self.sell(data=d, size=base_size, exectype=bt.Order.Market)
-                        self.orders[d].append(o1)
-                        limit_deep = d.close[0] + (self.inds[d]['atr'][0] * self.p.m_atr_mult)
-                        o2 = self.sell(data=d, size=base_size // 2, price=limit_deep, exectype=bt.Order.Limit, valid=1)
-                        self.orders[d].append(o2)
-
-                        self.trade_source[d] = 'M'
-                        self.log(f"[{d._name}] [SQUEEZE MODE] M-Strategy Breakout! Market + Limit")
-
-            # --- 持仓状态：B策略特有的离场逻辑 ---
-            else:
-                # 只有震荡单(B)需要回归中轨平仓
-                # T和M单子享受趋势红利，直到移动止损被触发
-                if self.trade_source[d] == 'B':
-                    mid = self.inds[d]['bb'].mid[0]
-                    if (pos.size > 0 and d.close[0] >= mid) or (pos.size < 0 and d.close[0] <= mid):
-                        self.close(data=d)
-                        self.log(f"[{d._name}] B-Strategy Target Reached (Mean Reversion)")
+            regime = self._determine_regime(d)
+            if regime == 'TREND':
+                self._run_t_strategy(d)
+            elif regime == 'VOLATILE':
+                self._run_b_strategy(d)
+            elif regime == 'SQUEEZE':
+                self._run_m_strategy(d)
 
     def notify_order(self, order):
         d = order.data
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-
-        if order in self.orders[d]:
-            self.orders[d].remove(order)
-
-        if order.status in [order.Completed]:
-            side = "BUY" if order.isbuy() else "SELL"
-            self.log(f"[{d._name}] {side} EXEC @ {order.executed.price:.2f} size={order.executed.size}")
-
+        if order.status in [order.Submitted, order.Accepted]: return
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected, order.Expired]:
+            self.order_pending[d] = False
+        if order.status == order.Completed:
+            action = "BUY" if order.isbuy() else "SELL"
+            price = order.executed.price
+            self.log_data(d, f"{action} EXECUTED @ {price:.2f}")
             if self.getposition(d).size != 0:
-                if side == "BUY":
-                    self.inds[d]['highest'] = max(self.inds[d]['highest'] or 0, d.close[0])
-                else:
-                    self.inds[d]['lowest'] = min(self.inds[d]['lowest'] or 999999, d.close[0])
-
-        elif order.status in [order.Canceled, order.Margin, order.Rejected, order.Expired]:
-            pass
+                self.trade_entry_price[d] = price
+                self.trade_stop_price[d] = None
+                self.is_breakeven_set[d] = False
+            else:
+                self.trade_entry_price[d] = None
+                self.trade_stop_price[d] = None
+                self.is_breakeven_set[d] = False
+                self.trade_source[d] = None
