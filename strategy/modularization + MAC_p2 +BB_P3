@@ -1,0 +1,517 @@
+import math
+import backtrader as bt
+
+
+# -----------------------------------------------------------------------------
+# 辅助指标
+# -----------------------------------------------------------------------------
+class AbsPctChange(bt.Indicator):
+    """计算绝对百分比变化，用于波动率计算"""
+    lines = ("abspct",)
+    params = (('period', 1),)
+
+    def __init__(self):
+        prev = self.data0(-1)
+        self.l.abspct = bt.If(prev != 0.0, abs(self.data0 / prev - 1.0), 0.0)
+
+
+# -----------------------------------------------------------------------------
+# 模块化综合策略 (Upgraded Composite Strategy)
+# -----------------------------------------------------------------------------
+class UpgradedCompositeStrategy(bt.Strategy):
+    """
+    升级版模块化策略 (Upgraded Modular Strategy)
+    整合了：
+    1. MACBB (趋势跟踪)
+    2. BBRSI (带状态过滤的均值回归)
+    3. MACD (动量)
+
+    新增功能：
+    - Regime Filter (市场状态过滤)
+    - ATR Based Risk Budgeting (基于ATR的风险预算仓位管理)
+    - Short Restrictions (做空限制)
+    - Pending Order Logic (挂单状态管理)
+    """
+
+    params = dict(
+        # --- 全局风控与投票参数 ---
+        vote_threshold=0.34,
+        exit_min_votes=2,
+        printlog=True,
+
+        # --- 权重配置 ---
+        weight_macbb=1.0,
+        weight_bbrsi=1.0,
+        weight_macd=1.0,
+
+        # --- [升级] 市场状态过滤 (Regime Filter - from BB_ATR_RSI_PS3) ---
+        use_regime_filter=True,  # 是否启用状态过滤
+        regime_ma_period=200,  # 长期趋势基准
+        regime_slope_lookback=20,  # 斜率回看周期
+        regime_slope_thresh=0.002,  # 趋势判定阈值 (0.2%)
+
+        # --- [升级] 做空限制 (Short Restriction - from BB_ATR_RSI_PS3) ---
+        allow_short=True,
+        restrict_shorts=True,  # 仅在下降趋势中做空
+        short_only_if_downtrend=True,  # 结合Regime判断
+
+        # --- [升级] 高级仓位管理 (Risk Budgeting - from MAC_BB_PS2) ---
+        # 替代了简单的反向波动率，使用基于ATR的风险预算
+        use_risk_sizing=True,
+        risk_total_budget=20_000.0,  # 所有资产的总风险预算 (现金)
+        risk_atr_period=14,  # 用于计算风险的ATR周期
+        risk_atr_mult=2.0,  # 止损距离倍数 (Stop Distance = ATR * Mult)
+        sizing_max_units=100000,
+        sizing_min_atr=1e-8,
+        sizing_base_stake=10,  # 降级默认手数
+
+        # -----------------------------------------------------------------
+        # 子模块 1: MACBB (Trend Following)
+        # -----------------------------------------------------------------
+        macbb_sma_fast_len=10,
+        macbb_sma_slow_len=30,
+        macbb_bb_period=20,
+        macbb_bb_dev=2.0,
+        macbb_trailing_stop_pct=0.10,
+        macbb_take_profit_pct=0.15,
+        macbb_mid_band_buffer=0.995,
+
+        # -----------------------------------------------------------------
+        # 子模块 2: BBRSI (Mean Reversion)
+        # -----------------------------------------------------------------
+        bbrsi_bb_period=20,
+        bbrsi_bb_dev=2.0,
+        bbrsi_use_rsi=True,
+        bbrsi_rsi_period=14,
+        bbrsi_rsi_buy_level=35,
+        bbrsi_rsi_sell_level=65,
+        bbrsi_exit_enabled=True,
+        bbrsi_stop_loss_pct=0.10,
+        bbrsi_take_profit_pct=0.20,
+        bbrsi_atr_period=14,
+        bbrsi_atr_sl_mult=2.0,
+
+        # -----------------------------------------------------------------
+        # 子模块 3: MACD (Momentum)
+        # -----------------------------------------------------------------
+        macd_ema_fast_len=12,
+        macd_ema_slow_len=26,
+        macd_signal_len=9,
+        macd_require_cross=True,
+        macd_use_atr_trail=True,
+        macd_trail_atr_period=14,
+        macd_trail_atr_mult=2.0,
+    )
+
+    def __init__(self):
+        # 1. 状态与资金管理
+        self.risk_budget_alloc = {}  # 存储分配给每个Data的风险预算
+        self.entry_price = {}
+        self.highest_price = {}
+        self.lowest_price = {}
+
+        # [升级] 订单状态管理 (防止重复下单)
+        self.order_pending = {}  # True if order is active
+        self.pending_order_ref = {}  # Reference to actual order object
+
+        # 2. 指标容器
+        self.inds_regime = {}  # 市场状态指标
+        self.inds_risk = {}  # 风控计算指标
+        self.inds_macbb = {}
+        self.inds_bbrsi = {}
+        self.inds_macd = {}
+
+        for d in self.datas:
+            self.order_pending[d] = False
+            self.pending_order_ref[d] = None
+
+            # 初始化各类指标
+            self._init_regime_inds(d)
+            self._init_risk_inds(d)
+            self._init_macbb_inds(d)
+            self._init_bbrsi_inds(d)
+            self._init_macd_inds(d)
+
+            self.entry_price[d] = None
+            self.highest_price[d] = None
+            self.lowest_price[d] = None
+
+    # -------------------------------------------------------------------------
+    # 初始化逻辑
+    # -------------------------------------------------------------------------
+
+    def _init_regime_inds(self, d):
+        """[升级] 初始化市场状态(Regime)指标 - 来自 BB_ATR_RSI_PS3"""
+        ma = bt.ind.SMA(d.close, period=self.p.regime_ma_period)
+
+        # 计算斜率 (Slope Proxy)
+        # 逻辑：(当前MA - N天前MA) / N天前MA
+        ma_prev = ma(-self.p.regime_slope_lookback)
+        slope = bt.If(ma_prev != 0.0, (ma - ma_prev) / ma_prev, 0.0)
+
+        self.inds_regime[d] = {
+            'ma': ma,
+            'slope': slope
+        }
+
+    def _init_risk_inds(self, d):
+        """[升级] 初始化风控指标 - 用于 PDF Sizing"""
+        # 计算波动率用于分配权重 (Volatility Proxy)
+        pct_change = AbsPctChange(d.close)
+        avg_vol = bt.ind.SMA(pct_change, period=self.p.regime_slope_lookback)  # 复用周期参数
+
+        # 专门用于计算止损距离的 ATR (Risk Sizing ATR)
+        atr = bt.ind.ATR(d, period=self.p.risk_atr_period)
+
+        self.inds_risk[d] = {
+            'avg_vol': avg_vol,
+            'atr': atr
+        }
+
+    def _init_macbb_inds(self, d):
+        sma_fast = bt.ind.SMA(d.close, period=self.p.macbb_sma_fast_len)
+        sma_slow = bt.ind.SMA(d.close, period=self.p.macbb_sma_slow_len)
+        bb = bt.ind.BollingerBands(d.close, period=self.p.macbb_bb_period, devfactor=self.p.macbb_bb_dev)
+        self.inds_macbb[d] = {
+            'sma_fast': sma_fast, 'sma_slow': sma_slow,
+            'cross_sma': bt.ind.CrossOver(sma_fast, sma_slow),
+            'bb': bb,
+            'cross_top': bt.ind.CrossOver(d.close, bb.top),
+            'cross_bot': bt.ind.CrossOver(d.close, bb.bot)
+        }
+
+    def _init_bbrsi_inds(self, d):
+        mid = bt.ind.SMA(d.close, period=self.p.bbrsi_bb_period)
+        std = bt.ind.StandardDeviation(d.close, period=self.p.bbrsi_bb_period)
+        atr = bt.ind.ATR(d, period=self.p.bbrsi_atr_period)  # BBRSI专用ATR
+        rsi = bt.ind.RSI(d.close, period=self.p.bbrsi_rsi_period) if self.p.bbrsi_use_rsi else None
+        self.inds_bbrsi[d] = {
+            'mid': mid, 'std': std, 'atr': atr, 'rsi': rsi,
+            'upper': mid + self.p.bbrsi_bb_dev * std,
+            'lower': mid - self.p.bbrsi_bb_dev * std
+        }
+
+    def _init_macd_inds(self, d):
+        macd = bt.ind.MACD(d.close,
+                           period_me1=self.p.macd_ema_fast_len,
+                           period_me2=self.p.macd_ema_slow_len,
+                           period_signal=self.p.macd_signal_len)
+        atr = bt.ind.ATR(d, period=self.p.macd_trail_atr_period)  # MACD专用ATR
+        self.inds_macd[d] = {
+            'macd': macd,
+            'cross': bt.ind.CrossOver(macd.macd, macd.signal),
+            'atr': atr
+        }
+
+    # -------------------------------------------------------------------------
+    # 辅助与计算方法
+    # -------------------------------------------------------------------------
+
+    def _is_valid(self, val):
+        return not math.isnan(val)
+
+    def _log(self, d, txt):
+        if self.p.printlog:
+            dt = d.datetime.date(0)
+            print(f"{dt} [{d._name}] {txt}")
+
+    def _update_trade_stats(self, d, pos_size, close_px):
+        if pos_size > 0:
+            if self.highest_price[d] is None or close_px > self.highest_price[d]:
+                self.highest_price[d] = close_px
+        elif pos_size < 0:
+            if self.lowest_price[d] is None or close_px < self.lowest_price[d]:
+                self.lowest_price[d] = close_px
+        else:
+            self.highest_price[d] = None
+            self.lowest_price[d] = None
+
+    # --- [升级] 市场状态判定 (from BB_ATR_RSI_PS3) ---
+    def _is_trending(self, d):
+        """判断市场是否处于强趋势中"""
+        if not self.p.use_regime_filter:
+            return False
+        slope = self.inds_regime[d]['slope'][0]
+        if not self._is_valid(slope): return False
+        return abs(slope) > self.p.regime_slope_thresh
+
+    def _is_short_allowed(self, d):
+        """判断是否允许做空 (基于Regime)"""
+        if not self.p.allow_short: return False
+        if not self.p.restrict_shorts: return True
+
+        # 必须在均线下方且斜率向下
+        ma = self.inds_regime[d]['ma'][0]
+        slope = self.inds_regime[d]['slope'][0]
+        close = d.close[0]
+
+        if not (self._is_valid(ma) and self._is_valid(slope)): return False
+
+        is_downtrend = (close < ma) and (slope < 0)
+        return is_downtrend
+
+    # --- [升级] 资金管理计算 (from MAC_BB_PS2) ---
+    def _calc_risk_budgets(self):
+        """
+        基于波动率倒数分配风险预算 (1/Vol 权重分配)
+        """
+        raw_weights = {}
+        total_inv_vol = 0.0
+
+        for d in self.datas:
+            vol = self.inds_risk[d]['avg_vol'][0]
+            if not self._is_valid(vol) or vol <= 0: continue
+
+            # 使用 1/Vol 作为权重
+            inv_vol = 1.0 / max(1e-8, vol)
+            raw_weights[d] = inv_vol
+            total_inv_vol += inv_vol
+
+        self.risk_budget_alloc = {}
+        if total_inv_vol > 0:
+            for d, w in raw_weights.items():
+                # 分配到的 Risk Budget ($) = (权重 / 总权重) * 总风险预算
+                self.risk_budget_alloc[d] = (w / total_inv_vol) * self.p.risk_total_budget
+
+    def _get_target_size(self, d):
+        """
+        计算目标仓位大小
+        逻辑: Size = Risk Budget / (ATR * Multiplier)
+        """
+        if not self.p.use_risk_sizing:
+            return self.p.sizing_base_stake
+
+        budget = self.risk_budget_alloc.get(d, 0.0)
+        atr = self.inds_risk[d]['atr'][0]
+
+        if budget <= 0 or not self._is_valid(atr) or atr <= 0:
+            return 0
+
+        atr = max(self.p.sizing_min_atr, atr)
+        stop_dist = atr * self.p.risk_atr_mult
+
+        # 计算手数
+        units = int(budget // stop_dist)
+        return max(0, min(self.p.sizing_max_units, units))
+
+    # -------------------------------------------------------------------------
+    # 信号生成 (Signals)
+    # -------------------------------------------------------------------------
+
+    def _signal_macbb(self, d, close_px):
+        """MACBB: 趋势跟踪策略"""
+        # 注意: 趋势策略不需要过滤掉 Trending 状态，反而喜欢 Trending
+        inds = self.inds_macbb[d]
+        c_mac = inds['cross_sma'][0]
+        sma_fast = inds['sma_fast'][0]
+        sma_slow = inds['sma_slow'][0]
+        bb_top = inds['bb'].top[0]
+        bb_bot = inds['bb'].bot[0]
+        c_top = inds['cross_top'][0]
+        c_bot = inds['cross_bot'][0]
+
+        if any(not self._is_valid(x) for x in [c_mac, sma_fast, bb_top]): return 0
+
+        # 入场逻辑
+        if c_mac > 0 and close_px > bb_top: return 1
+        if c_mac < 0 and close_px < bb_bot: return -1
+        if sma_fast > sma_slow and c_top > 0: return 1
+        if sma_fast < sma_slow and c_bot < 0: return -1
+        return 0
+
+    def _signal_bbrsi(self, d, close_px):
+        """BBRSI: 均值回归策略 (受Regime过滤)"""
+
+        # [升级] 如果市场处于强趋势，禁用均值回归入场
+        if self._is_trending(d):
+            return 0
+
+        inds = self.inds_bbrsi[d]
+        up = inds['upper'][0]
+        low = inds['lower'][0]
+        rsi = inds['rsi'][0] if inds['rsi'] else None
+
+        if not self._is_valid(up): return 0
+
+        if close_px < low:
+            if rsi is None or (self._is_valid(rsi) and rsi <= self.p.bbrsi_rsi_buy_level):
+                return 1
+
+        if close_px > up:
+            if rsi is None or (self._is_valid(rsi) and rsi >= self.p.bbrsi_rsi_sell_level):
+                return -1
+
+        return 0
+
+    def _signal_macd(self, d):
+        """MACD: 动量策略"""
+        inds = self.inds_macd[d]
+        if self.p.macd_require_cross:
+            cross = inds['cross'][0]
+            return 1 if cross > 0 else (-1 if cross < 0 else 0)
+        else:
+            m = inds['macd'].macd[0]
+            s = inds['macd'].signal[0]
+            return 1 if m > s else (-1 if m < s else 0)
+
+    # -------------------------------------------------------------------------
+    # 出场逻辑 (Exits)
+    # -------------------------------------------------------------------------
+    # 注：出场逻辑通常不需要Regime过滤，有盈利或止损就走
+
+    def _check_exit_macbb(self, d, pos_size, close_px, entry_px):
+        inds = self.inds_macbb[d]
+        if pos_size > 0:
+            if self.highest_price[d] is not None:
+                if close_px <= self.highest_price[d] * (1.0 - self.p.macbb_trailing_stop_pct): return True
+            if close_px >= entry_px * (1.0 + self.p.macbb_take_profit_pct): return True
+            if inds['cross_sma'][0] < 0: return True
+            if close_px < inds['bb'].mid[0] * self.p.macbb_mid_band_buffer: return True
+        else:  # Short
+            if self.lowest_price[d] is not None:
+                if close_px >= self.lowest_price[d] * (1.0 + self.p.macbb_trailing_stop_pct): return True
+            if close_px <= entry_px * (1.0 - self.p.macbb_take_profit_pct): return True
+            if inds['cross_sma'][0] > 0: return True
+            if close_px > inds['bb'].mid[0] * (2.0 - self.p.macbb_mid_band_buffer): return True
+        return False
+
+    def _check_exit_bbrsi(self, d, pos_size, close_px, pos_avg):
+        if not self.p.bbrsi_exit_enabled: return False
+        inds = self.inds_bbrsi[d]
+        atr = inds['atr'][0]
+        if not self._is_valid(atr): return False
+
+        sl_amt = max(pos_avg * self.p.bbrsi_stop_loss_pct, atr * self.p.bbrsi_atr_sl_mult)
+
+        if pos_size > 0:
+            if close_px <= pos_avg - sl_amt: return True
+            if close_px >= pos_avg * (1.0 + self.p.bbrsi_take_profit_pct): return True
+        else:
+            if close_px >= pos_avg + sl_amt: return True
+            if close_px <= pos_avg * (1.0 - self.p.bbrsi_take_profit_pct): return True
+        return False
+
+    def _check_exit_macd(self, d, pos_size, close_px):
+        if not self.p.macd_use_atr_trail: return False
+        inds = self.inds_macd[d]
+        atr = inds['atr'][0]
+        if not self._is_valid(atr): return False
+
+        trail = atr * self.p.macd_trail_atr_mult
+        if pos_size > 0 and self.highest_price[d] is not None:
+            if close_px <= self.highest_price[d] - trail: return True
+        elif pos_size < 0 and self.lowest_price[d] is not None:
+            if close_px >= self.lowest_price[d] + trail: return True
+        return False
+
+    # -------------------------------------------------------------------------
+    # 主循环 (Main Loop)
+    # -------------------------------------------------------------------------
+
+    def next(self):
+        # 1. 预计算资金预算 (Risk Budgeting)
+        if self.p.use_risk_sizing:
+            self._calc_risk_budgets()
+
+        for d in self.datas:
+            # [升级] 检查是否有挂单 (来自 MAC_BB_PS2)
+            if self.order_pending[d]:
+                continue
+
+            close_px = d.close[0]
+            if not self._is_valid(close_px): continue
+
+            pos = self.getposition(d)
+            pos_size = pos.size
+
+            # --- 持仓管理 ---
+            if pos_size != 0:
+                if self.entry_price[d] is None: self.entry_price[d] = pos.price
+                self._update_trade_stats(d, pos_size, close_px)
+
+                # 出场投票
+                exit_votes = 0
+                pos_avg = pos.price if pos.price > 0 else self.entry_price[d]
+
+                if self._check_exit_macbb(d, pos_size, close_px, self.entry_price[d]): exit_votes += 1
+                if self._check_exit_bbrsi(d, pos_size, close_px, pos_avg): exit_votes += 1
+                if self._check_exit_macd(d, pos_size, close_px): exit_votes += 1
+
+                if exit_votes >= self.p.exit_min_votes:
+                    self._log(d, f"EXIT TRIGGERED (Votes: {exit_votes})")
+                    self.close(data=d)
+                    self.order_pending[d] = True  # Lock
+                continue
+
+            # --- 入场管理 ---
+            s1 = self._signal_macbb(d, close_px)
+            s2 = self._signal_bbrsi(d, close_px)  # 内部含Regime检查
+            s3 = self._signal_macd(d)
+
+            w_sum = self.p.weight_macbb + self.p.weight_bbrsi + self.p.weight_macd
+            score = (
+                                s1 * self.p.weight_macbb + s2 * self.p.weight_bbrsi + s3 * self.p.weight_macd) / w_sum if w_sum > 0 else 0
+
+            direction = 0
+            if score >= self.p.vote_threshold:
+                direction = 1
+            elif score <= -self.p.vote_threshold:
+                direction = -1
+
+            if direction != 0:
+                # [升级] 做空限制检查
+                if direction < 0:
+                    if not self._is_short_allowed(d):
+                        # self._log(d, "Short signal ignored by Regime/Filter")
+                        continue
+
+                # 计算仓位
+                qty = self._get_target_size(d)
+                if qty > 0:
+                    size = direction * qty
+                    self._log(d, f"ENTRY SIGNAL (Score: {score:.2f}) Size: {size}")
+
+                    if direction > 0:
+                        self.buy(data=d, size=size)
+                    else:
+                        self.sell(data=d, size=abs(size))
+
+                    self.order_pending[d] = True  # Lock
+
+    # --- [升级] 订单回调与状态管理 (from MAC_BB_PS2) ---
+    def notify_order(self, order):
+        d = order.data
+
+        # 1. 记录订单引用 (用于取消等操作)
+        if order.status in [order.Submitted, order.Accepted]:
+            self.pending_order_ref[d] = order
+            return
+
+        # 2. 订单结束 (完成/取消/拒绝) -> 解锁 Pending 状态
+        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
+            self.order_pending[d] = False
+            self.pending_order_ref[d] = None
+
+        # 3. 日志与状态重置
+        if order.status == order.Completed:
+            action = "BUY" if order.isbuy() else "SELL"
+            self._log(d, f"{action} EXECUTED @ {order.executed.price:.2f}")
+
+            # 更新/重置 价格锚点
+            if self.getposition(d).size != 0:
+                self.entry_price[d] = order.executed.price
+                if self.getposition(d).size > 0:
+                    self.highest_price[d] = order.executed.price
+                    self.lowest_price[d] = None
+                else:
+                    self.lowest_price[d] = order.executed.price
+                    self.highest_price[d] = None
+            else:
+                self.entry_price[d] = None
+                self.highest_price[d] = None
+                self.lowest_price[d] = None
+
+        elif order.status == order.Canceled:
+            self._log(d, "Order Canceled")
+        elif order.status == order.Margin:
+            self._log(d, "Order Margin Error")
