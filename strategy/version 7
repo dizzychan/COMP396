@@ -1,0 +1,529 @@
+import backtrader as bt
+import datetime
+
+
+class EliteSniperStrategyV7(bt.Strategy):
+    params = dict(
+        printlog=True,
+
+        # --- [风控 Core: 基础] ---
+        risk_total_budget=400000.0,  # 保持 6.py 的设定
+        risk_per_trade_cap=0.075,  # 保持 6.py 的设定
+        risk_atr_period=14,
+
+        # --- [进攻核心：潜伏者模式 (Predator Mode)] --- [新增]
+        # 只要满足“潜伏条件”(ADX>22 + 加速)，就直接上双倍仓位
+        predator_adx_threshold=24,  # 进场门槛
+        super_risk_budget_mult=2.0,  # 资金分配权重翻倍
+        super_risk_cap_mult=2,  # 单笔风控上限放宽 (0.075 * 1.5 = 11.25%)
+
+        # --- [常规出场 Exit] ---
+        take_profit_mult=3.0,  # 常规止盈：3倍 ATR
+        stop_loss_mult=2.0,  # 常规止损：2倍 ATR
+
+        # --- [超级趋势 & 棘轮 & 动能衰竭防守] ---
+        super_adx_threshold=28,  # 只有真正走强到 28，才确认为超级趋势(护盾用)
+        super_tp_mult=6.0,  # 超级目标
+        super_sl_mult=3.0,  # 觉醒后的超级止损空间
+        ratchet_lock_mult=3.2,  # 滑点缓冲锁利线
+        super_trend_duration=7,  # 超级趋势固定护盾周期 (14天)
+
+        # [动能衰竭逃生参数]
+        super_bailout_drops=2,  # 连续衰退天数 (2天)
+        super_bailout_r_floor=3.0,  # 仅在利润达到 3.0R 后才启用逃生
+        super_bailout_r_ceil=4.0,  # 仅在利润低于 4.0R 时生效
+
+        # --- [环境识别 Regime] ---
+        adx_threshold=20,
+        bbw_upper_mult=1.4,
+
+        # --- [战术 T: Trend] ---
+        t_ma_filter=200,
+        t_fast=20, t_slow=60,
+        t_pullback_atr=0.3,
+
+        # --- [战术 B: Bollinger] ---
+        b_period=20, b_dev=2.4,
+        b_rsi_oversold=35,
+        b_rsi_overbought=65,
+
+        # --- [战术 M: Momentum] ---
+        m_vol_mult=1.1,
+        m_trend_ma=20,
+
+        # 其他
+        max_units=200000,
+        cooldown=2
+    )
+
+    def __init__(self):
+        self.order_pending = {}
+        self.trade_source = {}
+        self.cooldown_timer = {}
+        self.risk_alloc = {}
+
+        self.trade_stop_price = {}
+        self.trade_entry_price = {}
+        self.tp_crossed = {}
+
+        # [核心改动：引入双阶段状态机]
+        self.super_trend_qualified = {}  # 记录是否曾触发过超级指标 (具有升级资格)
+        self.is_super_mode_active = {}  # 记录是否已越过3.0R，正式激活了超级状态
+        self.super_trend_timer = {}  # 护盾倒计时
+
+        self.inds = {}
+
+        for d in self.datas:
+            self.order_pending[d] = None
+            self.trade_source[d] = None
+            self.cooldown_timer[d] = 0
+            self.trade_stop_price[d] = None
+            self.trade_entry_price[d] = None
+            self.tp_crossed[d] = False
+
+            self.super_trend_qualified[d] = False
+            self.is_super_mode_active[d] = False
+            self.super_trend_timer[d] = 0
+
+            self.inds[d] = {}
+
+            self.inds[d]['atr'] = bt.ind.ATR(d, period=self.p.risk_atr_period)
+            self.inds[d]['adx'] = bt.ind.ADX(d, period=14)
+            self.inds[d]['ma_200'] = bt.ind.SMA(d.close, period=self.p.t_ma_filter)
+            self.inds[d]['ma_20'] = bt.ind.SMA(d.close, period=self.p.m_trend_ma)
+
+            bb = bt.ind.BollingerBands(d.close, period=self.p.b_period, devfactor=self.p.b_dev)
+            self.inds[d]['bb'] = bb
+            self.inds[d]['bbw'] = bt.If(bb.mid != 0, (bb.top - bb.bot) / bb.mid, 0.0)
+            self.inds[d]['avg_bbw'] = bt.ind.SMA(self.inds[d]['bbw'], period=50)
+
+            self.inds[d]['rsi'] = bt.ind.RSI(d.close, period=14)
+            self.inds[d]['vol_ma'] = bt.ind.SMA(d.volume, period=20)
+
+            sma_f = bt.ind.SMA(d.close, period=self.p.t_fast)
+            sma_s = bt.ind.SMA(d.close, period=self.p.t_slow)
+            self.inds[d]['t_crossover'] = bt.ind.CrossOver(sma_f, sma_s)
+
+            self.inds[d]['macd'] = bt.ind.MACD(d.close)
+            self.inds[d]['m_crossover'] = bt.ind.CrossOver(self.inds[d]['macd'].macd, self.inds[d]['macd'].signal)
+
+    def log_data(self, d, txt):
+        if self.p.printlog:
+            dt = d.datetime.date(0)
+            print(f"{dt} [{d._name}] {txt}")
+
+    # -------------------------------------------------------------------------
+    # [核心新增] 潜伏者判定：ADX > 22 且 连续3天加速
+    # -------------------------------------------------------------------------
+    def _is_predator_setup(self, d):
+        adx = self.inds[d]['adx']
+        # 确保有足够数据进行3天比较
+        if len(adx) < 3:
+            return False
+
+        adx_0 = adx[0]  # 今天
+        adx_1 = adx[-1]  # 昨天
+        adx_2 = adx[-2]  # 前天
+
+        close = d.close[0]
+        ma_20 = self.inds[d]['ma_20'][0]
+        macd_line = self.inds[d]['macd'].macd[0]
+        macd_signal = self.inds[d]['macd'].signal[0]
+
+        # [判定条件1] 3天 ADX 必须持续递增 (加速态)
+        is_adx_accelerating = (adx_0 > adx_1) and (adx_1 > adx_2)
+
+        # [判定条件2] 当前值必须大于潜伏门槛 (22)
+        is_adx_high_enough = adx_0 > self.p.predator_adx_threshold
+
+        # 综合判定：数值够大 + 正在加速 + 形态配合 + 动能配合
+        is_strong_long = is_adx_high_enough and is_adx_accelerating and (close > ma_20) and (macd_line > macd_signal)
+        is_strong_short = is_adx_high_enough and is_adx_accelerating and (close < ma_20) and (macd_line < macd_signal)
+
+        return is_strong_long or is_strong_short
+
+    def _calc_risk_budgets(self):
+        raw_weights = {}
+        total_inv_vol = 0.0
+        for d in self.datas:
+            atr = self.inds[d]['atr'][0]
+            if atr <= 0: continue
+            w = 1.0 / atr
+            raw_weights[d] = w
+            total_inv_vol += w
+        self.risk_alloc = {}
+        if total_inv_vol > 0:
+            for d, w in raw_weights.items():
+                self.risk_alloc[d] = (w / total_inv_vol) * self.p.risk_total_budget
+
+    # -------------------------------------------------------------------------
+    # 仓位计算：基于“潜伏者”信号放宽风控
+    # -------------------------------------------------------------------------
+    def _get_size(self, d):
+        budget = self.risk_alloc.get(d, 0.0)
+        atr = self.inds[d]['atr'][0]
+        if budget <= 0 or atr <= 0: return 0
+
+        current_cap_pct = self.p.risk_per_trade_cap
+
+        # [核心改动] 检查是否满足“潜伏抢跑”条件
+        is_predator = self._is_predator_setup(d)
+
+        if is_predator:
+            # 满足潜伏条件，直接双倍预算轰炸
+            budget *= self.p.super_risk_budget_mult
+            current_cap_pct *= self.p.super_risk_cap_mult
+            # 可选：self.log_data(d, "[SIZE] Predator Mode Triggered! Double Size Loaded.")
+
+        max_risk_dollar = self.broker.getvalue() * current_cap_pct
+        active_budget = min(budget, max_risk_dollar)
+
+        stop_dist = atr * self.p.stop_loss_mult
+        if stop_dist == 0: return 0
+
+        units = int(active_budget // stop_dist)
+        return min(units, self.p.max_units)
+
+    def _determine_regime(self, d):
+        adx = self.inds[d]['adx'][0]
+        bbw = self.inds[d]['bbw'][0]
+        avg_bbw = self.inds[d]['avg_bbw'][0]
+        close = d.close[0]
+        ma_200 = self.inds[d]['ma_200'][0]
+        if adx > self.p.adx_threshold:
+            if close > ma_200:
+                return 'UP_TREND'
+            elif close < ma_200:
+                return 'DOWN_TREND'
+        if bbw > (avg_bbw * self.p.bbw_upper_mult): return 'VOLATILE'
+        if bbw < (avg_bbw * 0.8): return 'SQUEEZE'
+        return 'NEUTRAL'
+
+    def _run_t_strategy(self, d, mode):
+        cross = self.inds[d]['t_crossover'][0]
+        atr = self.inds[d]['atr'][0]
+        price = d.close[0]
+        if mode == 'LONG' and cross > 0:
+            size = self._get_size(d)
+            if size == 0: return
+            limit_price = price - (atr * self.p.t_pullback_atr)
+            self.order_pending[d] = self.buy(data=d, size=size, price=limit_price, exectype=bt.Order.Limit)
+            self.trade_source[d] = 'T_LONG'
+            self.log_data(d, f"[T-LONG] MA Cross. Limit BUY @ {limit_price:.2f}")
+        elif mode == 'SHORT' and cross < 0:
+            size = self._get_size(d)
+            if size == 0: return
+            limit_price = price + (atr * self.p.t_pullback_atr)
+            self.order_pending[d] = self.sell(data=d, size=size, price=limit_price, exectype=bt.Order.Limit)
+            self.trade_source[d] = 'T_SHORT'
+            self.log_data(d, f"[T-SHORT] MA Cross. Limit SELL @ {limit_price:.2f}")
+
+    def _run_b_strategy(self, d):
+        bb = self.inds[d]['bb']
+        rsi = self.inds[d]['rsi'][0]
+        close = d.close[0]
+        atr = self.inds[d]['atr'][0]
+        size = self._get_size(d)
+        if size == 0: return
+        if close < bb.bot[0] and rsi < self.p.b_rsi_oversold:
+            limit_price = bb.bot[0] - (atr * 0.1)
+            self.order_pending[d] = self.buy(data=d, size=size, price=limit_price, exectype=bt.Order.Limit)
+            self.trade_source[d] = 'B_LONG'
+            self.log_data(d, f"[B-LONG] Oversold. Limit BUY @ {limit_price:.2f}")
+        elif close > bb.top[0] and rsi > self.p.b_rsi_overbought:
+            limit_price = bb.top[0] + (atr * 0.1)
+            self.order_pending[d] = self.sell(data=d, size=size, price=limit_price, exectype=bt.Order.Limit)
+            self.trade_source[d] = 'B_SHORT'
+            self.log_data(d, f"[B-SHORT] Overbought. Limit SELL @ {limit_price:.2f}")
+
+    def _run_m_strategy(self, d):
+        cross = self.inds[d]['m_crossover'][0]
+        vol_spike = d.volume[0] > (self.inds[d]['vol_ma'][0] * self.p.m_vol_mult)
+        ma_20 = self.inds[d]['ma_20'][0]
+        if cross > 0 and vol_spike and d.close[0] > ma_20:
+            size = self._get_size(d)
+            if size == 0: return
+            self.buy(data=d, size=size, exectype=bt.Order.Market)
+            self.trade_source[d] = 'M_LONG'
+            self.log_data(d, "[M-LONG] Breakout! Market BUY.")
+        elif cross < 0 and vol_spike and d.close[0] < ma_20:
+            size = self._get_size(d)
+            if size == 0: return
+            self.sell(data=d, size=size, exectype=bt.Order.Market)
+            self.trade_source[d] = 'M_SHORT'
+            self.log_data(d, "[M-SHORT] Breakdown! Market SELL.")
+
+    # -------------------------------------------------------------------------
+    # 出场与循环
+    # -------------------------------------------------------------------------
+
+    def _manage_position(self, d, pos):
+        entry = self.trade_entry_price[d]
+        atr = self.inds[d]['atr'][0]
+        if not entry or atr == 0: return
+
+        adx = self.inds[d]['adx'][0]
+        close = d.close[0]
+        ma_20 = self.inds[d]['ma_20'][0]
+        macd_line = self.inds[d]['macd'].macd[0]
+        macd_signal = self.inds[d]['macd'].signal[0]
+
+        is_super_long = (adx > self.p.super_adx_threshold) and (close > ma_20) and (macd_line > macd_signal)
+        is_super_short = (adx > self.p.super_adx_threshold) and (close < ma_20) and (macd_line < macd_signal)
+
+        # ---------------------------------------------------------
+        # 第一阶段：记录超级趋势“升级资格”
+        # ---------------------------------------------------------
+        if pos.size > 0 and is_super_long:
+            self.super_trend_qualified[d] = True
+        elif pos.size < 0 and is_super_short:
+            self.super_trend_qualified[d] = True
+
+        normal_tp_long = entry + (atr * self.p.take_profit_mult)
+        normal_tp_short = entry - (atr * self.p.take_profit_mult)
+
+        ratchet_lock_long = entry + (atr * self.p.ratchet_lock_mult)
+        ratchet_lock_short = entry - (atr * self.p.ratchet_lock_mult)
+
+        # ---------------------------------------------------------
+        # 第二阶段：状态切换与护盾倒计时检测
+        # ---------------------------------------------------------
+        if pos.size > 0:
+            # 1. 觉醒检测：到达3.0R且具备资格，正式激活超级状态
+            if not self.is_super_mode_active[d] and self.super_trend_qualified[d]:
+                if close >= normal_tp_long:
+                    self.is_super_mode_active[d] = True
+                    self.super_trend_timer[d] = self.p.super_trend_duration
+                    self.log_data(d,
+                                  f"[REGIME] 觉醒！已越过 {self.p.take_profit_mult}R，激活超级护盾 ({self.p.super_trend_duration} 天).")
+
+            # 2. 护盾维持检测 (仅在超级状态下运行)
+            if self.is_super_mode_active[d]:
+                self.super_trend_timer[d] -= 1
+                if self.super_trend_timer[d] <= 0:
+                    if is_super_long:  # 到期大考通过
+                        self.super_trend_timer[d] = self.p.super_trend_duration
+                        self.log_data(d, f"[REGIME] 护盾充能！超级趋势延续，续期 {self.p.super_trend_duration} 天.")
+                    else:  # 大考挂科，立刻剥夺超级状态降级为普通状态
+                        self.is_super_mode_active[d] = False
+                        self.super_trend_qualified[d] = False
+                        self.log_data(d, "[REGIME] 超级趋势破位！护盾失效，降级回普通模式.")
+
+        elif pos.size < 0:
+            # 1. 觉醒检测
+            if not self.is_super_mode_active[d] and self.super_trend_qualified[d]:
+                if close <= normal_tp_short:
+                    self.is_super_mode_active[d] = True
+                    self.super_trend_timer[d] = self.p.super_trend_duration
+                    self.log_data(d,
+                                  f"[REGIME] 觉醒！已越过 {self.p.take_profit_mult}R，激活超级护盾 ({self.p.super_trend_duration} 天).")
+
+            # 2. 护盾维持检测
+            if self.is_super_mode_active[d]:
+                self.super_trend_timer[d] -= 1
+                if self.super_trend_timer[d] <= 0:
+                    if is_super_short:
+                        self.super_trend_timer[d] = self.p.super_trend_duration
+                        self.log_data(d, f"[REGIME] 护盾充能！超级趋势延续，续期 {self.p.super_trend_duration} 天.")
+                    else:
+                        self.is_super_mode_active[d] = False
+                        self.super_trend_qualified[d] = False
+                        self.log_data(d, "[REGIME] 超级趋势破位！护盾失效，降级回普通模式.")
+
+        # ---------------------------------------------------------
+        # 第三阶段：执行实际出场动作
+        # ---------------------------------------------------------
+
+        # ====== 多头出场逻辑 ======
+        if pos.size > 0:
+            if not self.is_super_mode_active[d]:
+                # === 赛道 A: 普通模式 ===
+                if close >= normal_tp_long:
+                    self.close(data=d)
+                    self.log_data(d, f"[EXIT] Long Target Hit (+{self.p.take_profit_mult}R). Normal Mode.")
+                    return
+
+                new_stop_level = close - (atr * self.p.stop_loss_mult)
+                if self.trade_stop_price[d] is None:
+                    self.trade_stop_price[d] = entry - (atr * self.p.stop_loss_mult)
+                else:
+                    self.trade_stop_price[d] = max(self.trade_stop_price[d], new_stop_level)
+
+                if close < self.trade_stop_price[d]:
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    self.log_data(d, "[EXIT] Long Trailing Stop (2.0R). Normal Mode.")
+
+            else:
+                # === 赛道 B: 超级状态 ===
+                # 【动能衰竭防守 (Bailout)】
+                is_two_days_down_long = (close < d.close[-1]) and (d.close[-1] < d.close[-2])
+                four_r_ceil_long = entry + (atr * self.p.super_bailout_r_ceil)
+                three_r_floor_long = entry + (atr * self.p.super_bailout_r_floor)
+
+                if is_two_days_down_long and (not is_super_long) and (three_r_floor_long <= close <= four_r_ceil_long):
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    self.log_data(d,
+                                  f"[EXIT] 动能衰竭逃生！Super trend broken, profit in [{self.p.super_bailout_r_floor}R, {self.p.super_bailout_r_ceil}R].")
+                    return
+
+                # --- 棘轮判定与止盈 ---
+                if close >= ratchet_lock_long:
+                    self.tp_crossed[d] = True
+
+                current_tp_mult = self.p.super_tp_mult
+                current_sl_mult = self.p.super_sl_mult
+
+                target = entry + (atr * current_tp_mult)
+                if close >= target:
+                    self.close(data=d)
+                    self.log_data(d, f"[EXIT] Long 终极目标到达 (+{current_tp_mult}R). Super Trend.")
+                    return
+
+                new_stop_level = close - (atr * current_sl_mult)
+
+                if self.tp_crossed[d]:
+                    new_stop_level = max(new_stop_level, ratchet_lock_long)
+
+                if self.trade_stop_price[d] is None:
+                    self.trade_stop_price[d] = entry - (atr * current_sl_mult)
+                else:
+                    self.trade_stop_price[d] = max(self.trade_stop_price[d], new_stop_level)
+
+                if close < self.trade_stop_price[d]:
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    if self.trade_stop_price[d] >= ratchet_lock_long:
+                        self.log_data(d,
+                                      f"[EXIT] 利润锁死机制触发！Secured +{self.p.ratchet_lock_mult}R via Ratchet Stop.")
+                    else:
+                        self.log_data(d, f"[EXIT] Long 超级追踪止损被破. (SL Mult: {current_sl_mult})")
+
+        # ====== 空头出场逻辑 ======
+        elif pos.size < 0:
+            if not self.is_super_mode_active[d]:
+                # === 赛道 A: 普通模式 ===
+                if close <= normal_tp_short:
+                    self.close(data=d)
+                    self.log_data(d, f"[EXIT] Short Target Hit (+{self.p.take_profit_mult}R). Normal Mode.")
+                    return
+
+                new_stop_level = close + (atr * self.p.stop_loss_mult)
+                if self.trade_stop_price[d] is None:
+                    self.trade_stop_price[d] = entry + (atr * self.p.stop_loss_mult)
+                else:
+                    self.trade_stop_price[d] = min(self.trade_stop_price[d], new_stop_level)
+
+                if close > self.trade_stop_price[d]:
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    self.log_data(d, "[EXIT] Short Trailing Stop (2.0R). Normal Mode.")
+
+            else:
+                # === 赛道 B: 超级状态 ===
+                # 【动能衰竭防守 (Bailout)】
+                is_two_days_up_short = (close > d.close[-1]) and (d.close[-1] > d.close[-2])
+                four_r_ceil_short = entry - (atr * self.p.super_bailout_r_ceil)
+                three_r_floor_short = entry - (atr * self.p.super_bailout_r_floor)
+
+                if is_two_days_up_short and (not is_super_short) and (
+                        four_r_ceil_short <= close <= three_r_floor_short):
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    self.log_data(d,
+                                  f"[EXIT] 动能衰竭逃生！Super trend broken, profit in [{self.p.super_bailout_r_floor}R, {self.p.super_bailout_r_ceil}R].")
+                    return
+
+                # --- 棘轮判定与止盈 ---
+                if close <= ratchet_lock_short:
+                    self.tp_crossed[d] = True
+
+                current_tp_mult = self.p.super_tp_mult
+                current_sl_mult = self.p.super_sl_mult
+
+                target = entry - (atr * current_tp_mult)
+                if close <= target:
+                    self.close(data=d)
+                    self.log_data(d, f"[EXIT] Short 终极目标到达 (+{current_tp_mult}R). Super Trend.")
+                    return
+
+                new_stop_level = close + (atr * current_sl_mult)
+
+                if self.tp_crossed[d]:
+                    new_stop_level = min(new_stop_level, ratchet_lock_short)
+
+                if self.trade_stop_price[d] is None:
+                    self.trade_stop_price[d] = entry + (atr * current_sl_mult)
+                else:
+                    self.trade_stop_price[d] = min(self.trade_stop_price[d], new_stop_level)
+
+                if close > self.trade_stop_price[d]:
+                    self.close(data=d)
+                    self.cooldown_timer[d] = self.p.cooldown
+                    if self.trade_stop_price[d] <= ratchet_lock_short:
+                        self.log_data(d,
+                                      f"[EXIT] 利润锁死机制触发！Secured +{self.p.ratchet_lock_mult}R via Ratchet Stop.")
+                    else:
+                        self.log_data(d, f"[EXIT] Short 超级追踪止损被破. (SL Mult: {current_sl_mult})")
+
+    def next(self):
+        self._calc_risk_budgets()
+
+        for d in self.datas:
+            if self.cooldown_timer[d] > 0:
+                self.cooldown_timer[d] -= 1
+                continue
+
+            pos = self.getposition(d)
+            if pos.size != 0:
+                self._manage_position(d, pos)
+                continue
+
+            if self.order_pending[d]:
+                continue
+
+            regime = self._determine_regime(d)
+
+            if regime == 'UP_TREND':
+                self._run_t_strategy(d, mode='LONG')
+            elif regime == 'DOWN_TREND':
+                self._run_t_strategy(d, mode='SHORT')
+            elif regime == 'VOLATILE':
+                self._run_b_strategy(d)
+            elif regime == 'SQUEEZE':
+                self._run_m_strategy(d)
+
+    def notify_order(self, order):
+        d = order.data
+        if order.status in [order.Submitted, order.Accepted]: return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log_data(d, f"BUY EXEC @ {order.executed.price:.2f}")
+            elif order.issell():
+                self.log_data(d, f"SELL EXEC @ {order.executed.price:.2f}")
+
+            # 订单完成后重置所有交易相关状态
+            if abs(self.getposition(d).size) > 0:
+                self.trade_entry_price[d] = order.executed.price
+                self.trade_stop_price[d] = None
+                self.tp_crossed[d] = False
+
+                self.super_trend_qualified[d] = False
+                self.is_super_mode_active[d] = False
+                self.super_trend_timer[d] = 0
+            else:
+                self.trade_entry_price[d] = None
+                self.trade_stop_price[d] = None
+                self.tp_crossed[d] = False
+
+                self.super_trend_qualified[d] = False
+                self.is_super_mode_active[d] = False
+                self.super_trend_timer[d] = 0
+
+            self.order_pending[d] = None
+
+        elif order.status in [order.Canceled, order.Margin, order.Rejected, order.Expired]:
+            self.order_pending[d] = None
+            self.trade_source[d] = None
